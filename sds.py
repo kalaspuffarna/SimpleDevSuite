@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """SDS - SimpleDevSuite"""
-
 import fcntl
 import os
 import pty
 import shutil
 import signal
 import struct
+import subprocess
 import sys
 import termios
 from pathlib import Path
@@ -17,6 +17,7 @@ import pyte
 from PIL import Image as PILImage
 from rich.segment import Segment
 from rich.style import Style
+from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.widget import Widget
 from textual.widgets import Static, Tree, TextArea, Button, Label, Input
@@ -58,6 +59,9 @@ WHITE  = "#ffffff"
 GREY   = "#444444"
 DGREY  = "#1a1a1a"
 RED    = "#d23c3d"
+GIT_UNTRACKED = RED
+GIT_MODIFIED  = "#e5c07b"
+GIT_STAGED    = "#98c379"
 
 I = {
     "python":      "\ue606",
@@ -443,7 +447,6 @@ _TERM_KEYS = {
 # ── Pty-backed subprocess — spawns a real shell attached to a pseudo-terminal ─
 class PtyProcess:
     def __init__(self, cwd: str, cols: int, rows: int):
-        import subprocess
         self.master_fd, slave_fd = pty.openpty()
         self._resize_fd(rows, cols)
         shell = os.environ.get("SHELL", "/bin/bash")
@@ -1075,6 +1078,8 @@ class SDS(App):
         self._search_index:   int                   = -1
         self._pending_chord:  Optional[str]          = None
         self._chord_timer                             = None
+        self._git_root:       Optional[str]          = None
+        self._git_statuses:   dict[str, str]         = {}
 
     def compose(self) -> ComposeResult:
         yield TabBar(id="tab-bar")
@@ -1116,11 +1121,90 @@ class SDS(App):
 
     def on_mount(self) -> None:
         self._update_tab_bar()
+        self._git_root = self._detect_git_root()
+        self._git_statuses = self._compute_git_status()
         tree = self.query_one(Tree)
         self._fill_tree(tree.root, self.start_dir)
         tree.root.expand()
         tree.focus()
         self._refresh_status()
+        if self._git_root:
+            self.set_interval(4.0, self._refresh_git_status)
+
+    def _detect_git_root(self) -> Optional[str]:
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "--show-toplevel"],
+                cwd=self.start_dir, capture_output=True, text=True, timeout=2,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if result.returncode != 0:
+            return None
+        return result.stdout.strip()
+
+    def _compute_git_status(self) -> dict[str, str]:
+        """{absolute_path: 2-char porcelain status} for everything git status
+        reports as changed. Empty dict if this isn't a git repo (or git
+        isn't available) — the tree just renders with no colors then."""
+        if not self._git_root:
+            return {}
+        try:
+            result = subprocess.run(
+                ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+                cwd=self._git_root, capture_output=True, text=True, timeout=2,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return {}
+        if result.returncode != 0:
+            return {}
+        statuses: dict[str, str] = {}
+        for line in result.stdout.splitlines():
+            if len(line) < 4:
+                continue
+            code = line[:2]
+            rel = line[3:]
+            if " -> " in rel:  # renames: "R  old -> new"
+                rel = rel.split(" -> ", 1)[1]
+            statuses[str(Path(self._git_root) / rel)] = code
+        return statuses
+
+    def _git_color_for(self, path: str, is_dir: bool) -> Optional[str]:
+        if not self._git_statuses:
+            return None
+        if is_dir:
+            prefix = path.rstrip("/") + "/"
+            codes = [c for p, c in self._git_statuses.items() if p.startswith(prefix)]
+        else:
+            code = self._git_statuses.get(path)
+            codes = [code] if code else []
+        if not codes:
+            return None
+        if any(c[0] == "?" and c[1] == "?" for c in codes):
+            return GIT_UNTRACKED
+        if any(c[1] not in (" ", "?") for c in codes):
+            return GIT_MODIFIED
+        return GIT_STAGED
+
+    def _refresh_git_status(self) -> None:
+        self._git_statuses = self._compute_git_status()
+        tree = self.query_one(Tree)
+        self._recolor_tree(tree.root)
+
+    def _recolor_tree(self, node: TreeNode) -> None:
+        if node.data:
+            path = Path(node.data)
+            node.set_label(self._tree_label(path, path.is_dir()))
+        for child in node.children:
+            self._recolor_tree(child)
+
+    def _tree_label(self, path: Path, is_dir: bool) -> Text:
+        icon = I["folder"] if is_dir else EXT_ICON.get(path.suffix.lower(), I["file"])
+        label = Text(f"{icon} {path.name}")
+        color = self._git_color_for(str(path), is_dir)
+        if color:
+            label.stylize(color)
+        return label
 
     def _fill_tree(self, node: TreeNode, path: str) -> None:
         try:
@@ -1130,10 +1214,9 @@ class SDS(App):
             )
             for e in entries:
                 if e.is_dir():
-                    node.add(f"{I['folder']} {e.name}", data=str(e), allow_expand=True)
+                    node.add(self._tree_label(e, True), data=str(e), allow_expand=True)
                 else:
-                    icon = EXT_ICON.get(e.suffix.lower(), I["file"])
-                    node.add_leaf(f"{icon} {e.name}", data=str(e))
+                    node.add_leaf(self._tree_label(e, False), data=str(e))
         except PermissionError:
             pass
 
@@ -1205,6 +1288,8 @@ class SDS(App):
             self.notify(f"Error: {exc}", severity="error")
             return
 
+        if self._git_root:
+            self._git_statuses = self._compute_git_status()
         self._refresh_dir(base, select_name=rel.split("/", 1)[0])
         if not is_dir:
             self._open_file(str(target))
@@ -1257,6 +1342,8 @@ class SDS(App):
             return
 
         self._remap_open_path(str(old_path), str(new_path))
+        if self._git_root:
+            self._git_statuses = self._compute_git_status()
         self._refresh_dir(str(old_path.parent), select_name=new_name)
         self._update_tab_bar()
         self._refresh_status()
@@ -1298,6 +1385,8 @@ class SDS(App):
             if not _is_terminal_tab(p) and (p == str(target) or p.startswith(prefix)):
                 self._close_path_silently(p)
 
+        if self._git_root:
+            self._git_statuses = self._compute_git_status()
         self._refresh_dir(str(target.parent))
         self.notify(f"Deleted {target.name}", timeout=1)
 
@@ -1450,6 +1539,8 @@ class SDS(App):
             self.modified.discard(self.active_tab)
             self._update_tab_bar()
             self._refresh_status()
+            if self._git_root:
+                self._refresh_git_status()
             self.notify(f"Saved {Path(path).name}", timeout=1)
         except Exception as exc:
             self.notify(f"Save failed: {exc}", severity="error")
@@ -1467,6 +1558,8 @@ class SDS(App):
         self.modified.clear()
         self._update_tab_bar()
         self._refresh_status()
+        if self._git_root:
+            self._refresh_git_status()
 
     def _do_quit(self) -> None:
         for term in self.terminals.values():
