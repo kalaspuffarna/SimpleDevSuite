@@ -10,6 +10,7 @@ import struct
 import subprocess
 import sys
 import termios
+import time
 import tomllib
 from pathlib import Path
 from typing import Optional
@@ -208,6 +209,13 @@ _NERDFONT_ICON = {
     "sql":         "\uf1c0",
     "terminal":    "\uf120",
     "pdf":         "\uf1c1",
+    "clock":            "\uf017",
+    "battery_full":     "\uf240",
+    "battery_high":     "\uf241",
+    "battery_medium":   "\uf242",
+    "battery_low":      "\uf243",
+    "battery_empty":    "\uf244",
+    "battery_charging": "\uf0e7",
 }
 
 _ASCII_ICON = {
@@ -216,6 +224,8 @@ _ASCII_ICON = {
     "c": "C", "cpp": "C++", "java": "JAV", "file": "-", "folder": "+",
     "folder_open": "~", "toml": "TML", "yaml": "YML", "xml": "XML",
     "sql": "SQL", "terminal": ">_", "pdf": "PDF",
+    "clock": "", "battery_full": "", "battery_high": "", "battery_medium": "",
+    "battery_low": "", "battery_empty": "", "battery_charging": "*",
 }
 
 _NONE_ICON = {k: "" for k in _NERDFONT_ICON}
@@ -255,6 +265,39 @@ COMMENT_TOKEN = {
     ".rs": "//", ".go": "//",
     ".sql": "--",
 }
+
+
+def _battery_status() -> Optional[tuple[int, bool]]:
+    """(percent, charging) from the first /sys/class/power_supply/BAT*
+    found, or None on a desktop with no battery."""
+    try:
+        bat_dirs = sorted(Path("/sys/class/power_supply").glob("BAT*"))
+    except OSError:
+        return None
+    if not bat_dirs:
+        return None
+    bat = bat_dirs[0]
+    try:
+        percent = int((bat / "capacity").read_text().strip())
+        status = (bat / "status").read_text().strip().lower()
+    except (OSError, ValueError):
+        return None
+    return percent, status == "charging"
+
+
+def _battery_icon(percent: int, charging: bool) -> str:
+    if charging:
+        return I["battery_charging"]
+    if percent >= 90:
+        return I["battery_full"]
+    if percent >= 65:
+        return I["battery_high"]
+    if percent >= 40:
+        return I["battery_medium"]
+    if percent >= 15:
+        return I["battery_low"]
+    return I["battery_empty"]
+
 
 CSS = f"""
 Screen {{
@@ -422,11 +465,25 @@ Button.-primary {{
     height: auto;
 }}
 
+#status-row {{
+    height: 1;
+    background: {BG_ALT};
+}}
+
 #status-bar {{
     height: 1;
     background: {BG_ALT};
     color: {MUTED};
     padding: 0 1;
+    width: 1fr;
+}}
+
+#system-info {{
+    height: 1;
+    background: {BG_ALT};
+    color: {ACCENT};
+    padding: 0 1;
+    width: auto;
 }}
 
 #search-bar {{
@@ -1550,7 +1607,9 @@ class SDS(App):
                     id="search-input",
                 )
                 yield Static("", id="search-info")
-            yield StatusBar(id="status-bar")
+            with Horizontal(id="status-row"):
+                yield StatusBar(id="status-bar")
+                yield Static("", id="system-info")
 
     def on_mount(self) -> None:
         self._update_tab_bar()
@@ -1564,6 +1623,16 @@ class SDS(App):
         self._refresh_status()
         if self._git_root:
             self.set_interval(4.0, self._refresh_git_status)
+        self._refresh_clock()
+        self.set_interval(15.0, self._refresh_clock)
+
+    def _refresh_clock(self) -> None:
+        parts = [f"{I['clock']} {time.strftime('%H:%M')}"]
+        battery = _battery_status()
+        if battery is not None:
+            percent, charging = battery
+            parts.append(f"{_battery_icon(percent, charging)} {percent}%")
+        self.query_one("#system-info", Static).update("  ".join(parts))
 
     def _detect_git_root(self) -> Optional[str]:
         try:
