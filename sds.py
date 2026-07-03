@@ -793,6 +793,17 @@ class SDSTerminal(Widget):
         rows = max(self.size.height, 3)
         self.vt = pyte.HistoryScreen(cols, rows, history=5000)
         self.vtstream = pyte.ByteStream(self.vt)
+        # pyte answers DA/DSR/CPR queries (device attributes, status, cursor
+        # position — `report_device_attributes` etc. in pyte/screens.py) by
+        # calling `write_process_input`, which is a no-op unless overridden.
+        # Left unwired, every capability probe a child process sends just
+        # vanishes: apps that use these probes to detect what the terminal
+        # can render (e.g. Unicode box-drawing vs. plain-ASCII fallback) get
+        # no answer and assume the worst. Route the reply back down the pty
+        # like a real terminal would.
+        self.vt.write_process_input = lambda data: (
+            self.pty.write(data.encode()) if self.pty is not None else None
+        )
         try:
             self.pty = PtyProcess(self.cwd, cols, rows)
         except Exception as exc:
