@@ -578,7 +578,10 @@ def _help_text() -> str:
         "  Terminal\n"
         f"    new terminal                          {k('leader')} then T\n"
         "    scrollback (mouse wheel also works)   Shift+PgUp/PgDn\n"
-        "    close the terminal                    type 'exit'\n\n"
+        "    close the terminal                    type 'exit'\n"
+        "    select text                           click + drag\n"
+        "    copy selection                        Ctrl+Shift+C\n"
+        "    paste                                 Ctrl+Shift+V\n\n"
         "  PDF viewer\n"
         "    next / previous page     PageUp/PageDown\n"
         "    zoom (image mode only)   +/-\n"
@@ -792,6 +795,13 @@ class SDSTerminal(Widget):
         self._dead = False
         self._poll_timer = None
         self._poll_tick = 0
+        # Mouse-drag text selection, for copy — each endpoint is an absolute
+        # (row, col) pair, where row is measured from the top of scrollback
+        # history so the marked region stays put even if the user scrolls
+        # mid-drag (see `_abs_row`).
+        self._sel_start: Optional[tuple[int, int]] = None
+        self._sel_end: Optional[tuple[int, int]] = None
+        self._selecting = False
 
     def on_mount(self) -> None:
         cols = max(self.size.width, 10)
@@ -913,30 +923,123 @@ class SDSTerminal(Widget):
         self._scroll(-3)
         event.stop()
 
-    # ── rendering ────────────────────────────────────────────────────────
-    def _display_line(self, y: int) -> dict:
+    # ── mouse-drag text selection ───────────────────────────────────────
+    def _abs_row(self, y: int) -> int:
+        """Row `y` on screen, expressed as an absolute index counting from
+        the top of scrollback history — stable across scrolling, unlike a
+        bare screen row."""
+        return len(self.vt.history.top) - self._scroll_offset + y
+
+    def _line_at_abs(self, idx: int) -> dict:
         vt = self.vt
-        if self._scroll_offset == 0:
-            return vt.buffer.get(y, {})
         history = vt.history.top
         total_history = len(history)
-        start = total_history - self._scroll_offset
-        idx = start + y
         if idx < 0:
             return {}
         if idx < total_history:
             return history[idx]
         return vt.buffer.get(idx - total_history, {})
 
+    def _clamp_mouse(self, event) -> tuple[int, int]:
+        x = max(0, min(self.size.width - 1, event.x))
+        y = max(0, min(self.size.height - 1, event.y))
+        return x, y
+
+    def on_mouse_down(self, event) -> None:
+        if self.vt is None or event.button != 1:
+            return
+        x, y = self._clamp_mouse(event)
+        self._sel_start = self._sel_end = (self._abs_row(y), x)
+        self._selecting = True
+        self.capture_mouse()
+        self.refresh()
+        event.stop()
+
+    def on_mouse_move(self, event) -> None:
+        if not self._selecting or self.vt is None:
+            return
+        x, y = self._clamp_mouse(event)
+        self._sel_end = (self._abs_row(y), x)
+        self.refresh()
+        event.stop()
+
+    def on_mouse_up(self, event) -> None:
+        if not self._selecting:
+            return
+        self._selecting = False
+        self.release_mouse()
+        if self._sel_start == self._sel_end:
+            # A plain click with no drag — clear rather than keep a
+            # zero-width "selection" marked.
+            self._sel_start = self._sel_end = None
+        self.refresh()
+        event.stop()
+
+    def _row_text(self, idx: int, c0: int, c1: int) -> str:
+        line = self._line_at_abs(idx)
+        c1 = min(c1, self.vt.columns - 1)
+        chars = [
+            (c.data if (c := line.get(x)) and c.data else " ")
+            for x in range(c0, c1 + 1)
+        ]
+        return "".join(chars).rstrip()
+
+    def _extract_selection(self) -> Optional[str]:
+        if self.vt is None or self._sel_start is None or self._sel_end is None:
+            return None
+        lo, hi = sorted((self._sel_start, self._sel_end))
+        if lo == hi:
+            return None
+        if lo[0] == hi[0]:
+            return self._row_text(lo[0], lo[1], hi[1])
+        width = self.vt.columns
+        lines = [self._row_text(lo[0], lo[1], width - 1)]
+        lines.extend(self._row_text(idx, 0, width - 1) for idx in range(lo[0] + 1, hi[0]))
+        lines.append(self._row_text(hi[0], 0, hi[1]))
+        return "\n".join(lines)
+
+    def _copy_selection(self) -> None:
+        text = self._extract_selection()
+        if not text:
+            return
+        self.app.copy_to_clipboard(text)
+        self.notify("Copied selection", timeout=1.5)
+
+    def _paste_clipboard(self) -> None:
+        text = self.app.clipboard
+        if not text or self.pty is None or self._dead:
+            return
+        self._scroll_offset = 0
+        self.pty.write(b"\x1b[200~" + text.encode("utf-8", errors="ignore") + b"\x1b[201~")
+
+    # ── rendering ────────────────────────────────────────────────────────
+    def _display_line(self, y: int) -> dict:
+        return self._line_at_abs(self._abs_row(y))
+
+    def _selected_range(self, abs_row: int) -> Optional[tuple[int, int]]:
+        """Column range (inclusive) selected on absolute row `abs_row`, if
+        any part of the current selection covers it."""
+        if self._sel_start is None or self._sel_end is None:
+            return None
+        lo, hi = sorted((self._sel_start, self._sel_end))
+        if lo == hi or not (lo[0] <= abs_row <= hi[0]):
+            return None
+        width = self.vt.columns
+        c0 = lo[1] if abs_row == lo[0] else 0
+        c1 = hi[1] if abs_row == hi[0] else width - 1
+        return c0, c1
+
     def render_line(self, y: int) -> Strip:
         if self.vt is None:
             return Strip.blank(self.size.width)
         width = self.size.width
-        line = self._display_line(y)
+        abs_row = self._abs_row(y)
+        line = self._line_at_abs(abs_row)
         cursor_x = None
         if (self._scroll_offset == 0 and not self.vt.cursor.hidden
                 and self.vt.cursor.y == y):
             cursor_x = self.vt.cursor.x
+        sel_range = self._selected_range(abs_row)
 
         segments = []
         cur_style: Optional[Style] = None
@@ -954,6 +1057,8 @@ class SDSTerminal(Widget):
             except Exception:
                 style = Style()
             if x == cursor_x:
+                style = style + Style(reverse=True)
+            if sel_range is not None and sel_range[0] <= x <= sel_range[1]:
                 style = style + Style(reverse=True)
             if cur_style is not None and style == cur_style:
                 cur_text.append(data)
@@ -1015,6 +1120,13 @@ class SDSTerminal(Widget):
             self._scroll(-max(self.size.height - 1, 1))
             event.stop(); event.prevent_default(); return
 
+        if key == "ctrl+shift+c":
+            self._copy_selection()
+            event.stop(); event.prevent_default(); return
+        if key == "ctrl+shift+v":
+            self._paste_clipboard()
+            event.stop(); event.prevent_default(); return
+
         if self._dead:
             app = self.app
             if hasattr(app, "_close_path_silently"):
@@ -1025,6 +1137,7 @@ class SDSTerminal(Widget):
         if data is None:
             return
         self._scroll_offset = 0
+        self._sel_start = self._sel_end = None
         if self.pty is not None:
             self.pty.write(data)
         event.stop()
