@@ -85,6 +85,30 @@ def _config_path() -> Path:
     return base / "sds" / "config"
 
 
+def _last_dir_path() -> Path:
+    return _config_path().parent / "last_dir"
+
+
+def _read_last_dir() -> str:
+    """The directory SDS was last opened in (like VS Code reopening its
+    last workspace when launched with no path) — "." if there's no
+    recorded last directory yet, or it no longer exists."""
+    try:
+        saved = _last_dir_path().read_text().strip()
+    except OSError:
+        return "."
+    return saved if saved and Path(saved).is_dir() else "."
+
+
+def _write_last_dir(path: str) -> None:
+    last_path = _last_dir_path()
+    try:
+        last_path.parent.mkdir(parents=True, exist_ok=True)
+        last_path.write_text(path)
+    except OSError:
+        pass
+
+
 def _merge_config(defaults: dict, overrides: dict) -> dict:
     """Shallow merge: only keys already present in `defaults` can be
     overridden — unknown sections/keys in the user's file are silently
@@ -2548,8 +2572,10 @@ class SDS(App):
 
 
 def main():
-    start = sys.argv[1] if len(sys.argv) > 1 else "."
-    SDS(start_dir=start).run()
+    start = sys.argv[1] if len(sys.argv) > 1 else _read_last_dir()
+    resolved = str(Path(start).resolve())
+    _write_last_dir(resolved)
+    SDS(start_dir=resolved).run()
 
 
 if __name__ == "__main__":
