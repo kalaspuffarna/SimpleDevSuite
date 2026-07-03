@@ -9,6 +9,7 @@ import struct
 import subprocess
 import sys
 import termios
+import tomllib
 from pathlib import Path
 from typing import Optional
 
@@ -21,7 +22,7 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.widget import Widget
 from textual.widgets import Static, Tree, TextArea, Button, Label, Input
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual import events
 from textual.binding import Binding
 from textual.strip import Strip
@@ -29,41 +30,156 @@ from textual.widgets.tree import TreeNode
 from textual.widgets.text_area import Selection
 from textual.screen import ModalScreen
 from textual_image.widget import AutoImage
-from textual_image.renderable.halfcell import Image as HalfcellRenderable
 from textual_image.renderable.sixel import Image as SixelRenderable
 from textual_image.renderable.tgp import Image as TGPRenderable
-from textual_image.renderable.unicode import Image as UnicodeRenderable
 from textual_image._terminal import get_cell_size
 from rich.markup import escape
 
 TERMINAL_TAB_PREFIX = "\x00terminal\x00"
 
-# The renderer AutoImage picked at import time is whatever this terminal's
-# graphics capability actually resolved to — put it first in the cycle list
-# under the "Auto" label so cycling starts from what auto-detection chose.
-_RENDER_MODES = [
-    ("Auto", AutoImage._Renderable),
-    ("TGP/Kitty", TGPRenderable),
-    ("Sixel", SixelRenderable),
-    ("Halfcell", HalfcellRenderable),
-    ("Unicode", UnicodeRenderable),
-]
-
-
 def _is_terminal_tab(path: str) -> bool:
     return path.startswith(TERMINAL_TAB_PREFIX)
 
-YELLOW = "#f5a623"
-BLACK  = "#000000"
-WHITE  = "#ffffff"
-GREY   = "#444444"
-DGREY  = "#1a1a1a"
-RED    = "#d23c3d"
-GIT_UNTRACKED = RED
+
+def _dir_prefix(path: str) -> str:
+    """`path` normalized to end in exactly one "/", for prefix-matching
+    everything nested under it (`p.startswith(_dir_prefix(path))`)."""
+    return path.rstrip("/") + "/"
+
+
+# ── Configuration ──────────────────────────────────────────────────────────
+# Built-in defaults, overridable by $XDG_CONFIG_HOME/sds/config (or
+# ~/.config/sds/config), a TOML file with no extension. See
+# default_config.toml (shipped alongside this script) for a fully
+# documented copy of every option below.
+DEFAULT_CONFIG: dict = {
+    "theme": "default",
+    "custom_theme": {
+        "accent": "#f5a623", "bg": "#000000", "fg": "#ffffff",
+        "muted": "#444444", "bg_alt": "#1a1a1a", "error": "#d23c3d",
+    },
+    "icons": {"style": "nerdfont"},
+    "pdf": {"mode": "auto"},
+    "keybinds": {
+        "quit": "alt+escape", "save": "ctrl+s", "find": "ctrl+f",
+        "new_entry": "ctrl+n", "close_tab": "ctrl+w", "leader": "ctrl+k",
+        "tree_up": "alt+up", "tree_down": "alt+down",
+        "tree_collapse": "alt+left", "tree_expand": "alt+right",
+        "tree_open": "alt+enter", "tree_rename": "alt+insert",
+        "tree_delete": "alt+delete",
+        "tab_prev": "alt+shift+left", "tab_next": "alt+shift+right",
+    },
+}
+
+
+def _config_path() -> Path:
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    base = Path(xdg) if xdg else Path.home() / ".config"
+    return base / "sds" / "config"
+
+
+def _merge_config(defaults: dict, overrides: dict) -> dict:
+    """Shallow merge: only keys already present in `defaults` can be
+    overridden — unknown sections/keys in the user's file are silently
+    ignored rather than erroring, so old configs stay valid across upgrades
+    that add new keys. Most top-level keys are sections (dicts merged
+    key-by-key), but a few (like `theme`) are plain scalars that get
+    replaced outright."""
+    merged = {
+        key: dict(value) if isinstance(value, dict) else value
+        for key, value in defaults.items()
+    }
+    for key, value in overrides.items():
+        if key not in merged:
+            continue
+        if isinstance(merged[key], dict) and isinstance(value, dict):
+            for sub_key, sub_value in value.items():
+                if sub_key in merged[key]:
+                    merged[key][sub_key] = sub_value
+        elif not isinstance(merged[key], dict) and not isinstance(value, dict):
+            merged[key] = value
+    return merged
+
+
+def _load_config() -> dict:
+    path = _config_path()
+    if not path.is_file():
+        return _merge_config(DEFAULT_CONFIG, {})
+    try:
+        with path.open("rb") as f:
+            data = tomllib.load(f)
+    except (tomllib.TOMLDecodeError, OSError) as exc:
+        print(f"sds: warning: failed to read config at {path}: {exc}", file=sys.stderr)
+        data = {}
+    return _merge_config(DEFAULT_CONFIG, data)
+
+
+CONFIG = _load_config()
+
+# Fallback used only if themes.toml is ever missing/unreadable — kept in
+# sync with themes.toml's own [default] table.
+_BUILTIN_DEFAULT_THEME = {
+    "accent": "#f5a623", "bg": "#000000", "fg": "#ffffff",
+    "muted": "#444444", "bg_alt": "#1a1a1a", "error": "#d23c3d",
+}
+
+
+def _load_themes() -> dict:
+    themes = {"default": _BUILTIN_DEFAULT_THEME}
+    path = Path(__file__).resolve().parent / "themes.toml"
+    try:
+        with path.open("rb") as f:
+            themes.update(tomllib.load(f))
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        print(f"sds: warning: failed to read themes.toml: {exc}", file=sys.stderr)
+    return themes
+
+
+THEMES = _load_themes()
+
+
+def _resolve_theme_colors() -> dict:
+    """`theme = "custom"` reads colors straight from the config's own
+    [custom_theme] section; any other name looks up a preset in
+    themes.toml (falling back to "default" with a warning if unknown)."""
+    name = CONFIG["theme"]
+    if name == "custom":
+        return CONFIG["custom_theme"]
+    if name in THEMES:
+        return THEMES[name]
+    print(f"sds: warning: unknown theme {name!r}, falling back to 'default'", file=sys.stderr)
+    return THEMES["default"]
+
+
+_theme_colors = _resolve_theme_colors()
+ACCENT = _theme_colors["accent"]
+BG     = _theme_colors["bg"]
+FG     = _theme_colors["fg"]
+MUTED  = _theme_colors["muted"]
+BG_ALT = _theme_colors["bg_alt"]
+ERROR  = _theme_colors["error"]
+GIT_UNTRACKED = ERROR
 GIT_MODIFIED  = "#e5c07b"
 GIT_STAGED    = "#98c379"
 
-I = {
+# Whether this terminal supports a real image protocol (Kitty graphics or
+# Sixel) rather than just a half-block/unicode approximation. AutoImage
+# resolves `_Renderable` once at import time (textual_image/renderable,
+# priority: Sixel > TGP/Kitty > half-cell > unicode) -- this is the same
+# capability check textual_image already did, just read back out.
+PDF_IMAGE_CAPABLE = AutoImage._Renderable in (TGPRenderable, SixelRenderable)
+
+
+def _resolve_pdf_mode() -> str:
+    configured = CONFIG["pdf"]["mode"]
+    if configured in ("image", "text"):
+        return configured
+    return "image" if PDF_IMAGE_CAPABLE else "text"
+
+
+PDF_MODE = _resolve_pdf_mode()
+
+_NERDFONT_ICON = {
     "python":      "\ue606",
     "js":          "\ue60c",
     "ts":          "\ue628",
@@ -87,6 +203,20 @@ I = {
     "terminal":    "\uf120",
     "pdf":         "\uf1c1",
 }
+
+_ASCII_ICON = {
+    "python": "PY", "js": "JS", "ts": "TS", "rust": "RS", "go": "GO",
+    "html": "HTM", "css": "CSS", "json": "JSN", "md": "MD", "bash": "SH",
+    "c": "C", "cpp": "C++", "java": "JAV", "file": "-", "folder": "+",
+    "folder_open": "~", "toml": "TML", "yaml": "YML", "xml": "XML",
+    "sql": "SQL", "terminal": ">_", "pdf": "PDF",
+}
+
+_NONE_ICON = {k: "" for k in _NERDFONT_ICON}
+
+I = {"nerdfont": _NERDFONT_ICON, "ascii": _ASCII_ICON, "none": _NONE_ICON}.get(
+    CONFIG["icons"]["style"], _NERDFONT_ICON
+)
 
 EXT_ICON = {
     ".py":   I["python"], ".js":  I["js"],   ".ts":   I["ts"],
@@ -122,14 +252,14 @@ COMMENT_TOKEN = {
 
 CSS = f"""
 Screen {{
-    background: {BLACK};
+    background: {BG};
 }}
 
 #tab-bar {{
     height: 2;
-    background: {BLACK};
-    color: {WHITE};
-    border-bottom: solid {YELLOW};
+    background: {BG};
+    color: {FG};
+    border-bottom: solid {ACCENT};
     padding: 0 1;
     overflow: hidden;
 }}
@@ -140,38 +270,38 @@ Screen {{
 
 #file-tree-panel {{
     width: 28;
-    border-right: solid {YELLOW};
-    background: {BLACK};
+    border-right: solid {ACCENT};
+    background: {BG};
 }}
 
 #tree-label {{
     height: 1;
-    background: {YELLOW};
-    color: {BLACK};
+    background: {ACCENT};
+    color: {BG};
     padding: 0 1;
     text-style: bold;
 }}
 
 Tree {{
-    background: {BLACK};
-    color: {WHITE};
-    scrollbar-color: {YELLOW} {BLACK};
+    background: {BG};
+    color: {FG};
+    scrollbar-color: {ACCENT} {BG};
     scrollbar-size: 1 1;
 }}
 
 Tree > .tree--cursor {{
-    background: {YELLOW};
-    color: {BLACK};
+    background: {ACCENT};
+    color: {BG};
 }}
 
 #editor-panel {{
-    background: {BLACK};
+    background: {BG};
     height: 1fr;
     width: 1fr;
 }}
 
 #welcome {{
-    color: {YELLOW};
+    color: {ACCENT};
     width: 1fr;
     height: 1fr;
     content-align: center middle;
@@ -182,21 +312,21 @@ Tree > .tree--cursor {{
 SDSEditor {{
     height: 1fr;
     width: 1fr;
-    background: {BLACK};
+    background: {BG};
 }}
 
 SDSEditor > .text-area--gutter {{
-    background: {DGREY};
-    color: {GREY};
+    background: {BG_ALT};
+    color: {MUTED};
 }}
 
 SDSEditor > .text-area--cursor-line {{
-    background: {DGREY};
+    background: {BG_ALT};
 }}
 
 SDSEditor > .text-area--cursor {{
-    background: {YELLOW};
-    color: {BLACK};
+    background: {ACCENT};
+    color: {BG};
 }}
 
 SDSEditor > .text-area--selection {{
@@ -211,15 +341,15 @@ ConfirmScreen {{
 #confirm-box {{
     width: 46;
     height: auto;
-    background: {BLACK};
-    border: solid {YELLOW};
+    background: {BG};
+    border: solid {ACCENT};
     padding: 1 2;
     align: center middle;
     layout: vertical;
 }}
 
 #confirm-label {{
-    color: {WHITE};
+    color: {FG};
     text-align: center;
     width: 1fr;
     height: auto;
@@ -233,25 +363,52 @@ ConfirmScreen {{
     height: auto;
 }}
 
+HelpScreen {{
+    align: center middle;
+    background: rgba(0,0,0,0.8);
+}}
+
+#help-box {{
+    width: 70;
+    height: 80%;
+    background: {BG};
+    border: solid {ACCENT};
+    padding: 1 2;
+}}
+
+#help-scroll {{
+    height: 1fr;
+}}
+
+#help-body {{
+    color: {FG};
+}}
+
+#help-hint {{
+    color: {MUTED};
+    height: 1;
+    margin-top: 1;
+}}
+
 Button {{
-    background: {BLACK};
-    color: {WHITE};
-    border: solid {GREY};
+    background: {BG};
+    color: {FG};
+    border: solid {MUTED};
     margin: 0 1;
     min-width: 12;
     height: 3;
 }}
 
 Button:focus {{
-    background: {YELLOW};
-    color: {BLACK};
-    border: solid {YELLOW};
+    background: {ACCENT};
+    color: {BG};
+    border: solid {ACCENT};
 }}
 
 Button.-primary {{
-    background: {YELLOW};
-    color: {BLACK};
-    border: solid {YELLOW};
+    background: {ACCENT};
+    color: {BG};
+    border: solid {ACCENT};
 }}
 
 #bottom-bar {{
@@ -261,32 +418,32 @@ Button.-primary {{
 
 #status-bar {{
     height: 1;
-    background: {DGREY};
-    color: {GREY};
+    background: {BG_ALT};
+    color: {MUTED};
     padding: 0 1;
 }}
 
 #search-bar {{
     height: 4;
-    background: {DGREY};
-    border-top: solid {YELLOW};
+    background: {BG_ALT};
+    border-top: solid {ACCENT};
     padding: 0 1;
     display: none;
 }}
 
 #search-input {{
     width: 1fr;
-    border: solid {GREY};
+    border: solid {MUTED};
 }}
 
 #search-input:focus {{
-    border: solid {YELLOW};
+    border: solid {ACCENT};
 }}
 
 #search-info {{
     width: auto;
     min-width: 9;
-    color: {GREY};
+    color: {MUTED};
     padding: 0 1;
     content-align: right middle;
 }}
@@ -295,17 +452,17 @@ SDSTerminal {{
     height: 1fr;
     width: 1fr;
     background: #000000;
-    border: solid {GREY};
+    border: solid {MUTED};
 }}
 
 SDSTerminal:focus {{
-    border: solid {YELLOW};
+    border: solid {ACCENT};
 }}
 
 SDSPdfViewer {{
     height: 1fr;
     width: 1fr;
-    background: {BLACK};
+    background: {BG};
     align: center middle;
 }}
 
@@ -317,11 +474,18 @@ SDSPdfViewer {{
     height: auto;
 }}
 
+#pdf-text {{
+    width: 1fr;
+    height: 1fr;
+    background: {BG};
+    color: {FG};
+}}
+
 #pdf-status {{
     dock: bottom;
     height: 1;
-    background: {DGREY};
-    color: {GREY};
+    background: {BG_ALT};
+    color: {MUTED};
     padding: 0 1;
     content-align: center middle;
 }}
@@ -334,13 +498,13 @@ NewEntryScreen {{
 #newentry-box {{
     width: 60;
     height: auto;
-    background: {BLACK};
-    border: solid {YELLOW};
+    background: {BG};
+    border: solid {ACCENT};
     padding: 1 2;
 }}
 
 #newentry-label {{
-    color: {WHITE};
+    color: {FG};
     width: 1fr;
     height: auto;
     margin-bottom: 1;
@@ -348,16 +512,16 @@ NewEntryScreen {{
 
 #newentry-input {{
     width: 1fr;
-    border: solid {GREY};
+    border: solid {MUTED};
     margin-bottom: 1;
 }}
 
 #newentry-input:focus {{
-    border: solid {YELLOW};
+    border: solid {ACCENT};
 }}
 
 #newentry-hint {{
-    color: {GREY};
+    color: {MUTED};
     width: 1fr;
     height: auto;
 }}
@@ -376,9 +540,48 @@ def _offset_to_location(text: str, offset: int) -> tuple[int, int]:
     return row, offset - line_start
 
 
+def _pretty_key(name: str) -> str:
+    """A configured key name (e.g. "ctrl+shift+s") formatted for display
+    (e.g. "Ctrl+Shift+S") — reads live from CONFIG so hint text never goes
+    stale after a rebind."""
+    key = CONFIG["keybinds"][name]
+    return "+".join(part.capitalize() for part in key.split("+"))
+
+
+def _help_text() -> str:
+    k = _pretty_key
+    return (
+        "  SDS — SimpleDevSuite\n\n"
+        "  General\n"
+        f"    {k('leader')} then H          this help screen\n"
+        f"    {k('new_entry')}                  new file/dir\n"
+        f"    {k('find')}                  find in file\n"
+        f"    {k('close_tab')}                  close tab\n"
+        f"    {k('save')}                  save\n"
+        f"    {k('quit')}            quit\n\n"
+        "  File tree\n"
+        f"    {k('tree_up')}/{k('tree_down')}       navigate tree\n"
+        f"    {k('tree_collapse')}/{k('tree_expand')}     collapse / expand dir\n"
+        f"    {k('tree_open')}          open file\n"
+        f"    {k('tree_rename')}         rename file/dir\n"
+        f"    {k('tree_delete')}         delete file/dir\n"
+        f"    {k('tab_prev')}/{k('tab_next')}  switch tabs\n\n"
+        "  Editor\n"
+        "    Ctrl+A                 select all\n"
+        f"    {k('leader')} then C          comment / uncomment selection\n\n"
+        "  Terminal\n"
+        f"    {k('leader')} then T          new terminal\n"
+        "    Shift+PgUp/PgDn         scrollback (mouse wheel also works)\n"
+        "    type 'exit'             close the terminal\n\n"
+        "  PDF viewer\n"
+        "    PageUp/PageDown         next / previous page\n"
+        "    +/-                     zoom (image mode only)\n"
+    )
+
+
 class SDSEditor(TextArea):
     # TextArea inserts printable characters itself before a Key event ever
-    # bubbles up to the App, so the Ctrl+K leader's follow-up key (c/t) has
+    # bubbles up to the App, so the leader chord's follow-up key (c/t/h) has
     # to be intercepted here — stopping it later at the App level is too
     # late to stop the character from being typed.
     def on_key(self, event: events.Key) -> None:
@@ -527,6 +730,7 @@ class SDSTerminal(Widget):
         self._scroll_offset = 0
         self._dead = False
         self._poll_timer = None
+        self._poll_tick = 0
 
     def on_mount(self) -> None:
         cols = max(self.size.width, 10)
@@ -564,8 +768,19 @@ class SDSTerminal(Widget):
             if self.pty is not None:
                 self.pty.resize(rows, cols)
 
+    # A hidden (switched-away-from) terminal tab still needs to keep
+    # draining its pty so scrollback doesn't fall behind, but nobody can see
+    # it — so it doesn't need the full 30Hz cadence. Every 6th tick (~5Hz)
+    # is enough to keep it reasonably current without paying for
+    # _update_title()'s syscalls (tcgetpgrp + a /proc/<pgid>/comm open) and
+    # the read/feed/refresh cycle 30x/sec for a screen nobody's watching.
+    _HIDDEN_POLL_DIVISOR = 6
+
     def _poll(self) -> None:
         if self.pty is None or self._dead:
+            return
+        self._poll_tick += 1
+        if not self.display and self._poll_tick % self._HIDDEN_POLL_DIVISOR:
             return
         self._sync_size()
         self._update_title()
@@ -689,27 +904,32 @@ class SDSTerminal(Widget):
 
     def on_key(self, event: events.Key) -> None:
         key = event.key
-        if key in ("alt+shift+left", "alt+shift+right", "alt+shift+w"):
-            # Ctrl+W itself is deliberately forwarded to the shell (readline
-            # delete-word) rather than closing the tab — the tab closes
-            # naturally once the shell exits (see `_dead` handling below).
-            # Alt+Shift+W is left exempted here as a harmless bonus shortcut
-            # for terminals/WMs that happen to let it through unmolested,
-            # but it's not reliable in general (commonly intercepted by the
-            # OS/WM before Textual ever sees it), so it isn't advertised.
+        kb  = CONFIG["keybinds"]
+        if key in (kb["close_tab"], kb["tab_prev"], kb["tab_next"], "alt+shift+w"):
+            # Close-tab/tab-cycling close the tab or switch tabs (App.on_key's
+            # bindings) instead of reaching the shell — same tradeoff every
+            # real terminal emulator makes, sacrificing e.g. readline's
+            # delete-previous-word binding on Ctrl+W for a consistent
+            # tab-close shortcut. Not stopping the event here lets it bubble
+            # up to the App unhandled. Alt+Shift+W is left exempted here too
+            # as a harmless bonus close-tab shortcut for terminals/WMs that
+            # happen to let it through unmolested, but it's not reliable in
+            # general (commonly intercepted by the OS/WM before Textual ever
+            # sees it), so it isn't advertised or configurable.
             return
 
         # The terminal forwards nearly everything to the shell, which would
-        # otherwise swallow the app's Ctrl+K leader (new terminal / comment)
-        # before it ever reaches the App — same tradeoff SDSEditor makes for
-        # the same reason. This is the one thing that stays reserved.
+        # otherwise swallow the app's leader chord (new terminal / comment /
+        # help) before it ever reaches the App — same tradeoff SDSEditor
+        # makes for the same reason. This is the one thing that stays
+        # reserved.
         app = self.app
-        if getattr(app, "_pending_chord", None) == "ctrl+k":
+        if getattr(app, "_pending_chord", None) == kb["leader"]:
             if hasattr(app, "_resolve_chord") and app._resolve_chord(key):
                 event.stop(); event.prevent_default(); return
             # unresolved: chord already cleared by _resolve_chord; fall
             # through so this keystroke still reaches the shell normally
-        elif key == "ctrl+k" and hasattr(app, "_arm_leader"):
+        elif key == kb["leader"] and hasattr(app, "_arm_leader"):
             app._arm_leader()
             event.stop(); event.prevent_default(); return
 
@@ -759,10 +979,12 @@ class SDSPdfViewer(Vertical):
         self.doc: Optional["fitz.Document"] = None
         self.page_index = 0
         self.zoom = 3.0
-        self.render_mode_index = 0
 
     def compose(self) -> ComposeResult:
-        yield AutoImage(id="pdf-image")
+        if PDF_MODE == "image":
+            yield AutoImage(id="pdf-image")
+        else:
+            yield TextArea("", id="pdf-text", read_only=True, show_line_numbers=False)
         yield Static("", id="pdf-status")
 
     def on_mount(self) -> None:
@@ -780,34 +1002,31 @@ class SDSPdfViewer(Vertical):
         if not self.doc:
             return
         page = self.doc[self.page_index]
-        pix = page.get_pixmap(matrix=fitz.Matrix(self.zoom, self.zoom))
-        pil_mode = "RGBA" if pix.alpha else "RGB"
-        img = PILImage.frombytes(pil_mode, (pix.width, pix.height), pix.samples)
-        self.query_one("#pdf-image", AutoImage).image = img
+        if PDF_MODE == "image":
+            pix = page.get_pixmap(matrix=fitz.Matrix(self.zoom, self.zoom))
+            pil_mode = "RGBA" if pix.alpha else "RGB"
+            img = PILImage.frombytes(pil_mode, (pix.width, pix.height), pix.samples)
+            self.query_one("#pdf-image", AutoImage).image = img
+        else:
+            text = page.get_text() or "[This page has no extractable text]"
+            self.query_one("#pdf-text", TextArea).text = text
         self._update_status()
 
     def _update_status(self) -> None:
         if not self.doc:
             return
-        mode_name = _RENDER_MODES[self.render_mode_index][0]
-        try:
-            cell = get_cell_size()
-            cell_info = f"  |  cell: {cell.width}x{cell.height}px"
-        except Exception:
-            cell_info = ""
+        nav = "PageUp/PageDown: navigate"
+        extra = ""
+        if PDF_MODE == "image":
+            nav += "  +/-: zoom"
+            try:
+                cell = get_cell_size()
+                extra = f"  |  cell: {cell.width}x{cell.height}px"
+            except Exception:
+                pass
         self.query_one("#pdf-status", Static).update(
-            f"Page {self.page_index + 1}/{self.doc.page_count}  |  "
-            f"PageUp/PageDown: navigate  +/-: zoom  m: render mode ({mode_name}){cell_info}"
+            f"Page {self.page_index + 1}/{self.doc.page_count}  |  {nav}{extra}"
         )
-
-    def cycle_render_mode(self) -> None:
-        self.render_mode_index = (self.render_mode_index + 1) % len(_RENDER_MODES)
-        mode_name, renderer_cls = _RENDER_MODES[self.render_mode_index]
-        img_widget = self.query_one("#pdf-image", AutoImage)
-        img_widget._Renderable = renderer_cls
-        img_widget.refresh(layout=True)
-        self._update_status()
-        self.notify(f"PDF render mode: {mode_name}", timeout=2)
 
     def next_page(self) -> None:
         if self.doc and self.page_index < self.doc.page_count - 1:
@@ -842,12 +1061,10 @@ class SDSPdfViewer(Vertical):
             self.next_page(); event.stop(); event.prevent_default()
         elif key in ("pageup", "up", "left"):
             self.prev_page(); event.stop(); event.prevent_default()
-        elif char in ("+", "="):
+        elif char in ("+", "=") and PDF_MODE == "image":
             self.zoom_in(); event.stop(); event.prevent_default()
-        elif char == "-":
+        elif char == "-" and PDF_MODE == "image":
             self.zoom_out(); event.stop(); event.prevent_default()
-        elif char == "m":
-            self.cycle_render_mode(); event.stop(); event.prevent_default()
 
 
 # ── Confirm dialog ────────────────────────────────────────────────────────────
@@ -945,6 +1162,20 @@ class RenameScreen(ModalScreen):
             event.stop()
 
 
+# ── Help screen — a keyboard cheat sheet for every window type ───────────────
+class HelpScreen(ModalScreen):
+    def compose(self) -> ComposeResult:
+        with Vertical(id="help-box"):
+            with VerticalScroll(id="help-scroll"):
+                yield Static(_help_text(), id="help-body")
+            yield Label("Esc: close", id="help-hint")
+
+    def on_key(self, event: events.Key) -> None:
+        if event.key == "escape":
+            self.dismiss()
+            event.stop()
+
+
 # ── Tab bar — markup=False so [[ ]] are literal characters ───────────────────
 class TabBar(Static):
     def __init__(self, **kwargs):
@@ -1039,11 +1270,9 @@ class StatusBar(Static):
                  col: int = 0, lang: str = "", modified: bool = False) -> None:
         if not filepath:
             self.update(
-                "Alt+Up/Down: tree  Alt+Left/Right: dir  Alt+Enter: open  "
-                "Alt+Insert: rename  Alt+Delete: delete  "
-                "Alt+Shift+Left/Right: tabs  Ctrl+N: new  Ctrl+F: find  "
-                "Ctrl+K then C/T: comment / terminal  "
-                "Ctrl+W: close  Ctrl+S: save  Ctrl+Q: quit"
+                f"{_pretty_key('leader')} H: help  •  "
+                f"{_pretty_key('tree_open')}: open  •  "
+                f"{_pretty_key('new_entry')}: new"
             )
             return
         name = Path(filepath).name
@@ -1053,35 +1282,55 @@ class StatusBar(Static):
             f"{icon} {name}{mod}  |  "
             f"Ln {row+1} Col {col+1}  |  "
             f"{lang or 'text'}  |  "
-            f"Ctrl+F: find  Ctrl+A: select all  Ctrl+K then C/T: comment / terminal  "
-            f"Ctrl+S: save  Ctrl+W: close  Ctrl+Q: quit"
+            f"{_pretty_key('leader')} H: help  •  "
+            f"{_pretty_key('save')}: save  •  "
+            f"{_pretty_key('close_tab')}: close"
         )
 
     def set_terminal_info(self) -> None:
         self.update(
-            f"{I['terminal']} Terminal  |  Shift+PgUp/PgDn or wheel: scrollback  |  "
-            f"type 'exit' to close  |  Alt+Shift+Left/Right: switch tabs  |  Ctrl+Q: quit"
+            f"{I['terminal']} Terminal  |  "
+            f"{_pretty_key('leader')} H: help  •  "
+            f"{_pretty_key('close_tab')}: close  •  "
+            f"Shift+PgUp/PgDn: scrollback"
         )
 
     def set_pdf_info(self, name: str) -> None:
         self.update(
-            f"{I['pdf']} {name}  |  PageUp/PageDown: page  +/-: zoom  m: render mode  |  "
-            f"Ctrl+W: close  Ctrl+Q: quit"
+            f"{I['pdf']} {name}  |  "
+            f"{_pretty_key('leader')} H: help  •  "
+            f"PageUp/PageDown: page  •  "
+            f"{_pretty_key('close_tab')}: close"
         )
 
 
 # ── Main app ──────────────────────────────────────────────────────────────────
+def _build_bindings() -> list:
+    """Textual's App has a built-in `ctrl+q -> quit` priority binding that
+    an empty subclass `BINDINGS = []` does NOT clear (Textual's binding
+    merge is a per-key overwrite across the MRO — an empty list contributes
+    zero keys, so it never touches App's inherited entry). To actually
+    neutralize Ctrl+Q and move quitting to the configured key instead, this
+    class needs its own priority binding occupying the same key."""
+    quit_key = CONFIG["keybinds"]["quit"]
+    bindings = []
+    if quit_key != "ctrl+q":
+        bindings.append(Binding("ctrl+q", "noop", show=False, priority=True))
+    bindings.append(Binding(quit_key, "quit", show=False, priority=True))
+    return bindings
+
+
 class SDS(App):
     CSS   = CSS
     TITLE = "SDS"
-    BINDINGS = []
+    BINDINGS = _build_bindings()
 
     def __init__(self, start_dir: str = "."):
         super().__init__()
         self.start_dir    = str(Path(start_dir).resolve())
         self.open_files:  list[str]           = []
         self.active_tab:  int                 = -1
-        self.modified:    set[int]            = set()
+        self._saved_text: dict[str, str]      = {}
         self.editors:     dict[str, SDSEditor] = {}
         self.pdf_viewers: dict[str, SDSPdfViewer] = {}
         self.terminals:   dict[str, SDSTerminal] = {}
@@ -1092,6 +1341,8 @@ class SDS(App):
         self._chord_timer                             = None
         self._git_root:       Optional[str]          = None
         self._git_statuses:   dict[str, str]         = {}
+        self._git_dir_rollup: dict[str, str]         = {}
+        self._tree_nodes:     dict[str, TreeNode]    = {}
 
     def compose(self) -> ComposeResult:
         yield TabBar(id="tab-bar")
@@ -1103,25 +1354,7 @@ class SDS(App):
                 )
                 yield Tree(self.start_dir, id="tree")
             with Vertical(id="editor-panel"):
-                yield Static(
-                    f"\n\n"
-                    f"  SDS \u2014 SimpleDevSuite\n\n"
-                    f"  Alt+Up/Down        navigate tree\n"
-                    f"  Alt+Left/Right     collapse / expand dir\n"
-                    f"  Alt+Enter          open file\n"
-                    f"  Alt+Insert         rename file/dir\n"
-                    f"  Alt+Delete         delete file/dir\n"
-                    f"  Alt+Shift+Left/Right  switch tabs\n"
-                    f"  Ctrl+N             new file/dir\n"
-                    f"  Ctrl+F             find in file\n"
-                    f"  Ctrl+A             select all\n"
-                    f"  Ctrl+K then C      comment / uncomment\n"
-                    f"  Ctrl+K then T      terminal\n"
-                    f"  Ctrl+W             close tab\n"
-                    f"  Ctrl+S             save\n"
-                    f"  Ctrl+Q             quit\n",
-                    id="welcome",
-                )
+                yield Static("\n" + _help_text(), id="welcome")
         with Vertical(id="bottom-bar"):
             with Horizontal(id="search-bar"):
                 yield Input(
@@ -1134,8 +1367,9 @@ class SDS(App):
     def on_mount(self) -> None:
         self._update_tab_bar()
         self._git_root = self._detect_git_root()
-        self._git_statuses = self._compute_git_status()
+        self._set_git_status(self._compute_git_status(), recolor=False)
         tree = self.query_one(Tree)
+        self._tree_nodes[str(Path(self.start_dir).resolve())] = tree.root
         self._fill_tree(tree.root, self.start_dir)
         tree.root.expand()
         tree.focus()
@@ -1181,27 +1415,65 @@ class SDS(App):
             statuses[str(Path(self._git_root) / rel)] = code
         return statuses
 
+    @staticmethod
+    def _git_color_for_code(code: str) -> str:
+        if code[0] == "?" and code[1] == "?":
+            return GIT_UNTRACKED
+        if code[1] not in (" ", "?"):
+            return GIT_MODIFIED
+        return GIT_STAGED
+
+    def _compute_git_dir_rollup(self, statuses: dict[str, str]) -> dict[str, str]:
+        """{directory_path: color} — the "worst" status color found anywhere
+        under that directory. Precomputed once per status snapshot instead
+        of the old approach, which rescanned the *entire* status dict for
+        every directory node on every recolor (O(files) per node)."""
+        priority = {GIT_STAGED: 0, GIT_MODIFIED: 1, GIT_UNTRACKED: 2}
+        rollup: dict[str, str] = {}
+        for path, code in statuses.items():
+            color = self._git_color_for_code(code)
+            d = Path(path).parent
+            while True:
+                key = str(d)
+                if key not in rollup or priority[color] > priority[rollup[key]]:
+                    rollup[key] = color
+                if key == self._git_root or d.parent == d:
+                    break
+                d = d.parent
+        return rollup
+
     def _git_color_for(self, path: str, is_dir: bool) -> Optional[str]:
         if not self._git_statuses:
             return None
         if is_dir:
-            prefix = path.rstrip("/") + "/"
-            codes = [c for p, c in self._git_statuses.items() if p.startswith(prefix)]
-        else:
-            code = self._git_statuses.get(path)
-            codes = [code] if code else []
-        if not codes:
-            return None
-        if any(c[0] == "?" and c[1] == "?" for c in codes):
-            return GIT_UNTRACKED
-        if any(c[1] not in (" ", "?") for c in codes):
-            return GIT_MODIFIED
-        return GIT_STAGED
+            return self._git_dir_rollup.get(path)
+        code = self._git_statuses.get(path)
+        return self._git_color_for_code(code) if code else None
+
+    def _set_git_status(self, statuses: dict[str, str], recolor: bool = True) -> None:
+        """Store a freshly computed git-status snapshot. Skips the rollup
+        rebuild and tree recolor entirely if nothing actually changed since
+        the last snapshot — the 4s poll used to unconditionally rebuild
+        every tree node's label regardless."""
+        if statuses == self._git_statuses:
+            return
+        self._git_statuses = statuses
+        self._git_dir_rollup = self._compute_git_dir_rollup(statuses)
+        if recolor:
+            self._recolor_tree(self.query_one(Tree).root)
+
+    def _refresh_git_status_worker(self) -> None:
+        statuses = self._compute_git_status()
+        self.call_from_thread(self._set_git_status, statuses)
 
     def _refresh_git_status(self) -> None:
-        self._git_statuses = self._compute_git_status()
-        tree = self.query_one(Tree)
-        self._recolor_tree(tree.root)
+        """Recompute git status off the event loop — `git status` on a big
+        repo can take real time, and this runs on a recurring 4s timer plus
+        after every save, so it must never block keystrokes/rendering."""
+        self.run_worker(
+            self._refresh_git_status_worker, thread=True, exclusive=True,
+            group="git-status",
+        )
 
     def _recolor_tree(self, node: TreeNode) -> None:
         if node.data:
@@ -1226,9 +1498,10 @@ class SDS(App):
             )
             for e in entries:
                 if e.is_dir():
-                    node.add(self._tree_label(e, True), data=str(e), allow_expand=True)
+                    child = node.add(self._tree_label(e, True), data=str(e), allow_expand=True)
                 else:
-                    node.add_leaf(self._tree_label(e, False), data=str(e))
+                    child = node.add_leaf(self._tree_label(e, False), data=str(e))
+                self._tree_nodes[str(e.resolve())] = child
         except PermissionError:
             pass
 
@@ -1237,24 +1510,28 @@ class SDS(App):
         if node.data and not node.children:
             self._fill_tree(node, node.data)
 
-    def _find_node(self, node: TreeNode, path: str) -> Optional[TreeNode]:
-        node_path = node.data or (self.start_dir if node.parent is None else None)
-        if node_path and Path(node_path).resolve() == Path(path).resolve():
-            return node
+    def _find_node(self, path: str) -> Optional[TreeNode]:
+        return self._tree_nodes.get(str(Path(path).resolve()))
+
+    def _forget_subtree(self, node: TreeNode) -> None:
+        """Drop every path->node entry for a node and its (already-loaded)
+        descendants — used before an in-place refresh discards them, so the
+        lookup dict never points at removed nodes."""
+        if node.data:
+            self._tree_nodes.pop(str(Path(node.data).resolve()), None)
         for child in node.children:
-            found = self._find_node(child, path)
-            if found is not None:
-                return found
-        return None
+            self._forget_subtree(child)
 
     def _refresh_dir(self, base: str, select_name: Optional[str] = None) -> None:
-        tree = self.query_one(Tree)
-        node = self._find_node(tree.root, base)
+        node = self._find_node(base)
         if node is None:
             return
         was_root = node.parent is None
+        for child in node.children:
+            self._forget_subtree(child)
         node.remove_children()
         self._fill_tree(node, base)
+        tree = self.query_one(Tree)
         if not was_root:
             node.expand()
         if select_name:
@@ -1301,7 +1578,7 @@ class SDS(App):
             return
 
         if self._git_root:
-            self._git_statuses = self._compute_git_status()
+            self._set_git_status(self._compute_git_status(), recolor=False)
         self._refresh_dir(base, select_name=rel.split("/", 1)[0])
         if not is_dir:
             self._open_file(str(target))
@@ -1309,19 +1586,20 @@ class SDS(App):
 
     def _remap_open_path(self, old: str, new: str) -> None:
         """After a rename, point any open tabs under `old` at `new` instead."""
-        old_prefix = old.rstrip("/") + "/"
+        old_prefix = _dir_prefix(old)
         for i, p in enumerate(self.open_files):
             if _is_terminal_tab(p):
                 continue
             if p == old:
                 remapped = new
             elif p.startswith(old_prefix):
-                remapped = new.rstrip("/") + "/" + p[len(old_prefix):]
+                remapped = _dir_prefix(new) + p[len(old_prefix):]
             else:
                 continue
             self.open_files[i] = remapped
             if p in self.editors:
                 self.editors[remapped] = self.editors.pop(p)
+                self._saved_text[remapped] = self._saved_text.pop(p)
             if p in self.pdf_viewers:
                 self.pdf_viewers[remapped] = self.pdf_viewers.pop(p)
 
@@ -1355,7 +1633,7 @@ class SDS(App):
 
         self._remap_open_path(str(old_path), str(new_path))
         if self._git_root:
-            self._git_statuses = self._compute_git_status()
+            self._set_git_status(self._compute_git_status(), recolor=False)
         self._refresh_dir(str(old_path.parent), select_name=new_name)
         self._update_tab_bar()
         self._refresh_status()
@@ -1392,13 +1670,13 @@ class SDS(App):
             self.notify(f"Delete failed: {exc}", severity="error")
             return
 
-        prefix = str(target).rstrip("/") + "/"
+        prefix = _dir_prefix(str(target))
         for p in list(self.open_files):
             if not _is_terminal_tab(p) and (p == str(target) or p.startswith(prefix)):
                 self._close_path_silently(p)
 
         if self._git_root:
-            self._git_statuses = self._compute_git_status()
+            self._set_git_status(self._compute_git_status(), recolor=False)
         self._refresh_dir(str(target.parent))
         self.notify(f"Deleted {target.name}", timeout=1)
 
@@ -1412,13 +1690,35 @@ class SDS(App):
         for w in self._panels():
             w.display = False
 
-    def _open_terminal(self) -> None:
-        """Always opens a brand new terminal tab, so you can have several
-        running side by side — switch between them with Alt+Shift+Left/Right."""
+    def _remove_welcome(self) -> None:
         try:
             self.query_one("#welcome").remove()
         except Exception:
             pass
+
+    def _panel_dict_for(self, path: str) -> Optional[dict]:
+        """Whichever of editors/pdf_viewers/terminals currently owns `path`."""
+        for panels in (self.terminals, self.pdf_viewers, self.editors):
+            if path in panels:
+                return panels
+        return None
+
+    def _show_panel(self, path: str) -> None:
+        """Hide every panel, then show and focus the one already open for
+        `path`. A no-op if nothing is open for `path` — checked before
+        hiding anything, so a bad path never blanks the current view."""
+        panels = self._panel_dict_for(path)
+        if panels is None:
+            return
+        self._hide_all_panels()
+        panel = panels[path]
+        panel.display = True
+        panel.focus()
+
+    def _open_terminal(self) -> None:
+        """Always opens a brand new terminal tab, so you can have several
+        running side by side — switch between them with Alt+Shift+Left/Right."""
+        self._remove_welcome()
 
         self._hide_all_panels()
 
@@ -1444,10 +1744,7 @@ class SDS(App):
             return
 
         panel = self.query_one("#editor-panel")
-        try:
-            self.query_one("#welcome").remove()
-        except Exception:
-            pass
+        self._remove_welcome()
 
         self._hide_all_panels()
 
@@ -1462,6 +1759,7 @@ class SDS(App):
                 id=f"ed_{len(self.editors)}",
             )
             self.editors[filepath] = ed
+            self._saved_text[filepath] = text
             panel.mount(ed)
         else:
             self.editors[filepath].display = True
@@ -1477,10 +1775,7 @@ class SDS(App):
 
     def _open_pdf(self, filepath: str) -> None:
         panel = self.query_one("#editor-panel")
-        try:
-            self.query_one("#welcome").remove()
-        except Exception:
-            pass
+        self._remove_welcome()
 
         self._hide_all_panels()
 
@@ -1509,9 +1804,21 @@ class SDS(App):
             return None
         return self.open_files[self.active_tab]
 
+    def _is_modified(self, path: str) -> bool:
+        """Whether `path`'s current editor content actually differs from
+        what's on disk — computed from content rather than a dirty flag, so
+        e.g. typing a character and then undoing it isn't flagged as a
+        change, and a stray edit event from some other widget can never
+        mark the wrong tab as modified."""
+        ed = self.editors.get(path)
+        return ed is not None and ed.text != self._saved_text.get(path)
+
+    def _modified_indices(self) -> set[int]:
+        return {i for i, p in enumerate(self.open_files) if self._is_modified(p)}
+
     def _update_tab_bar(self) -> None:
         self.query_one(TabBar).refresh_tabs(
-            self.open_files, self.active_tab, self.modified,
+            self.open_files, self.active_tab, self._modified_indices(),
         )
 
     def _refresh_status(self) -> None:
@@ -1530,11 +1837,16 @@ class SDS(App):
         if ed:
             r, c = ed.cursor_location
             lang = EXT_LANG.get(Path(path).suffix.lower(), "")
-            sb.set_info(path, r, c, lang, self.active_tab in self.modified)
+            sb.set_info(path, r, c, lang, self._is_modified(path))
 
-    def on_text_area_changed(self, _: TextArea.Changed) -> None:
-        if self.active_tab >= 0:
-            self.modified.add(self.active_tab)
+    def on_text_area_changed(self, event: TextArea.Changed) -> None:
+        # TextArea is no longer exclusive to SDSEditor — the PDF viewer's
+        # text-mode fallback (#pdf-text) also uses one, and setting its
+        # `.text` on every page render/switch would otherwise fire this too.
+        # Harmless now regardless (modified-ness is computed from content,
+        # not set here), but skip the refresh for anything that isn't the
+        # active editor so a background PDF re-render doesn't repaint chrome.
+        if self.active_tab >= 0 and event.text_area is self._active_editor():
             self._update_tab_bar()
             self._refresh_status()
 
@@ -1548,7 +1860,7 @@ class SDS(App):
             return
         try:
             Path(path).write_text(ed.text)
-            self.modified.discard(self.active_tab)
+            self._saved_text[path] = ed.text
             self._update_tab_bar()
             self._refresh_status()
             if self._git_root:
@@ -1558,16 +1870,16 @@ class SDS(App):
             self.notify(f"Save failed: {exc}", severity="error")
 
     def _save_all(self) -> None:
-        for idx in sorted(self.modified):
+        for idx in sorted(self._modified_indices()):
             path = self.open_files[idx]
             ed = self.editors.get(path)
             if ed is None:
                 continue
             try:
                 Path(path).write_text(ed.text)
+                self._saved_text[path] = ed.text
             except Exception as exc:
                 self.notify(f"Save failed for {Path(path).name}: {exc}", severity="error")
-        self.modified.clear()
         self._update_tab_bar()
         self._refresh_status()
         if self._git_root:
@@ -1578,12 +1890,18 @@ class SDS(App):
             term.kill()
         self.exit()
 
+    def action_noop(self) -> None:
+        """Bound to Ctrl+Q when it's not the configured quit key, so it's a
+        true no-op instead of falling through to anything else."""
+        pass
+
     async def action_quit(self) -> None:
         if len(self.screen_stack) > 1:
             return
 
-        if self.modified:
-            n = len(self.modified)
+        modified = self._modified_indices()
+        if modified:
+            n = len(modified)
 
             def handle(save: bool) -> None:
                 if save:
@@ -1607,7 +1925,8 @@ class SDS(App):
     def _close_tab(self) -> None:
         if not self.open_files or self.active_tab < 0:
             return
-        if self.active_tab in self.modified:
+        path = self._active_path()
+        if path and self._is_modified(path):
             def handle(save: bool) -> None:
                 if save:
                     self._save_current()
@@ -1624,10 +1943,6 @@ class SDS(App):
         closing_active = idx == self.active_tab
 
         path = self.open_files.pop(idx)
-        self.modified = {
-            (i if i < idx else i - 1)
-            for i in self.modified if i != idx
-        }
         if path in self.terminals:
             term = self.terminals.pop(path)
             term.kill()
@@ -1638,21 +1953,12 @@ class SDS(App):
             viewer.remove()
         elif path in self.editors:
             self.editors.pop(path).remove()
+            self._saved_text.pop(path, None)
 
         if closing_active:
             if self.open_files:
                 self.active_tab = min(idx, len(self.open_files) - 1)
-                fp = self.open_files[self.active_tab]
-                self._hide_all_panels()
-                if fp in self.terminals:
-                    self.terminals[fp].display = True
-                    self.terminals[fp].focus()
-                elif fp in self.pdf_viewers:
-                    self.pdf_viewers[fp].display = True
-                    self.pdf_viewers[fp].focus()
-                else:
-                    self.editors[fp].display = True
-                    self.editors[fp].focus()
+                self._show_panel(self.open_files[self.active_tab])
             else:
                 self.active_tab = -1
                 self.query_one(Tree).focus()
@@ -1776,20 +2082,14 @@ class SDS(App):
     def _switch_to_terminal(self, tab_id: str) -> None:
         """Switch to an existing terminal tab — unlike _open_terminal(),
         this never creates a new one (used for tab-cycling)."""
-        term = self.terminals.get(tab_id)
-        if term is None:
+        if tab_id not in self.terminals:
             return
-        try:
-            self.query_one("#welcome").remove()
-        except Exception:
-            pass
-        self._hide_all_panels()
-        term.display = True
+        self._remove_welcome()
+        self._show_panel(tab_id)
         self.active_tab = self.open_files.index(tab_id)
         self._update_tab_bar()
         self._refresh_status()
         self._sync_search()
-        term.focus()
 
     def _show_tab(self, path: str) -> None:
         if path in self.terminals:
@@ -1799,12 +2099,13 @@ class SDS(App):
 
     # ── Ctrl+K leader key: c = toggle comment, t = terminal ─────────────────
     def _arm_leader(self) -> None:
-        self._pending_chord = "ctrl+k"
+        self._pending_chord = CONFIG["keybinds"]["leader"]
         if self._chord_timer:
             self._chord_timer.stop()
         self._chord_timer = self.set_timer(2.5, self._clear_chord)
         self.query_one(StatusBar).update(
-            "Ctrl+K …  c: comment/uncomment   t: terminal   (any other key cancels)"
+            f"{_pretty_key('leader')} …  c: comment/uncomment   t: terminal   "
+            "h: help   (any other key cancels)"
         )
 
     def _clear_chord(self) -> None:
@@ -1813,9 +2114,9 @@ class SDS(App):
         self._refresh_status()
 
     def _resolve_chord(self, key: str) -> bool:
-        """Resolve a pending Ctrl+K chord with the given follow-up key.
+        """Resolve a pending leader chord with the given follow-up key.
         Returns True if the key was consumed (caller should stop the event)."""
-        if self._pending_chord != "ctrl+k":
+        if self._pending_chord != CONFIG["keybinds"]["leader"]:
             return False
         self._pending_chord = None
         if self._chord_timer:
@@ -1830,6 +2131,9 @@ class SDS(App):
             return True
         if key == "t":
             self._open_terminal()
+            return True
+        if key == "h":
+            self.push_screen(HelpScreen())
             return True
         self._refresh_status()
         return False
@@ -1883,23 +2187,24 @@ class SDS(App):
 
     def on_key(self, event: events.Key) -> None:
         key = event.key
+        kb  = CONFIG["keybinds"]
 
         if len(self.screen_stack) > 1:
             return
 
-        if key == "ctrl+k" and not isinstance(self.focused, Input):
+        if key == kb["leader"] and not isinstance(self.focused, Input):
             self._arm_leader()
             event.stop(); event.prevent_default(); return
 
         # If not consumed, _resolve_chord already cleared the chord and
         # refreshed the status bar; the key falls through normally below.
-        if self._pending_chord == "ctrl+k" and self._resolve_chord(key):
+        if self._pending_chord == kb["leader"] and self._resolve_chord(key):
             event.stop(); event.prevent_default(); return
 
-        if key == "ctrl+f":
+        if key == kb["find"]:
             self._toggle_search(); event.stop(); return
 
-        if key == "ctrl+n":
+        if key == kb["new_entry"]:
             self._open_new_entry(); event.stop(); return
 
         search_bar = self.query_one("#search-bar")
@@ -1913,15 +2218,15 @@ class SDS(App):
                 if key == "up":
                     self._search_next(-1); event.stop(); return
 
-        if key == "ctrl+s":
+        if key == kb["save"]:
             self._save_current(); event.stop(); return
 
-        if key in ("ctrl+w", "alt+shift+w"):
+        if key in (kb["close_tab"], "alt+shift+w"):
             self._close_tab(); event.stop(); return
 
-        if key in ("alt+shift+left", "alt+shift+right"):
+        if key in (kb["tab_prev"], kb["tab_next"]):
             if self.open_files:
-                delta = -1 if key == "alt+shift+left" else 1
+                delta = -1 if key == kb["tab_prev"] else 1
                 self.active_tab = (self.active_tab + delta) % len(self.open_files)
                 self._show_tab(self.open_files[self.active_tab])
             event.stop(); return
@@ -1929,15 +2234,15 @@ class SDS(App):
         tree = self.query_one(Tree)
         ed   = self._active_editor()
 
-        if key in ("alt+up", "alt+down"):
-            if key == "alt+up":
+        if key in (kb["tree_up"], kb["tree_down"]):
+            if key == kb["tree_up"]:
                 tree.action_cursor_up()
             else:
                 tree.action_cursor_down()
             if ed: ed.focus()
             event.stop(); return
 
-        if key == "alt+left":
+        if key == kb["tree_collapse"]:
             node = tree.cursor_node
             if node:
                 try:
@@ -1947,7 +2252,7 @@ class SDS(App):
             if ed: ed.focus()
             event.stop(); return
 
-        if key == "alt+right":
+        if key == kb["tree_expand"]:
             node = tree.cursor_node
             if node and node.data:
                 try:
@@ -1962,7 +2267,7 @@ class SDS(App):
             if ed: ed.focus()
             event.stop(); return
 
-        if key == "alt+enter":
+        if key == kb["tree_open"]:
             node = tree.cursor_node
             if node and node.data:
                 try:
@@ -1974,12 +2279,12 @@ class SDS(App):
                     self.notify(f"Error: {exc}", timeout=2)
             event.stop(); return
 
-        if key == "alt+insert":
+        if key == kb["tree_rename"]:
             self._rename_selected()
             if ed: ed.focus()
             event.stop(); return
 
-        if key == "alt+delete":
+        if key == kb["tree_delete"]:
             self._delete_selected()
             if ed: ed.focus()
             event.stop(); event.prevent_default(); return

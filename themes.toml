@@ -1,0 +1,48 @@
+# SDS (SimpleDevSuite) preset themes.
+#
+# Each table below is a named theme, selectable in your config via e.g.
+# `theme = "monokai"`. Add your own by adding a new [name] table with the
+# same six keys — no code changes needed, SDS reads this file at startup.
+#
+# `theme = "custom"` does NOT use anything in this file; it reads colors
+# straight from the [custom_theme] section of your own config instead.
+
+[default]
+accent = "#f5a623"
+bg     = "#000000"
+fg     = "#ffffff"
+muted  = "#444444"
+bg_alt = "#1a1a1a"
+error  = "#d23c3d"
+
+[monokai]
+accent = "#fd971f"
+bg     = "#272822"
+fg     = "#f8f8f2"
+muted  = "#75715e"
+bg_alt = "#3e3d32"
+error  = "#f92672"
+
+[dracula]
+accent = "#bd93f9"
+bg     = "#282a36"
+fg     = "#f8f8f2"
+muted  = "#6272a4"
+bg_alt = "#44475a"
+error  = "#ff5555"
+
+[nord]
+accent = "#88c0d0"
+bg     = "#2e3440"
+fg     = "#d8dee9"
+muted  = "#4c566a"
+bg_alt = "#3b4252"
+error  = "#bf616a"
+
+[gruvbox]
+accent = "#fe8019"
+bg     = "#282828"
+fg     = "#ebdbb2"
+muted  = "#928374"
+bg_alt = "#3c3836"
+error  = "#fb4934"

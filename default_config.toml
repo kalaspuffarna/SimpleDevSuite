@@ -1,0 +1,90 @@
+# SDS (SimpleDevSuite) configuration.
+#
+# Copy this file to ~/.config/sds/config (respecting $XDG_CONFIG_HOME if you
+# have it set, and note the destination file has NO extension) to override
+# any of the defaults shown below.
+#
+# You only need to include the keys you actually want to change — missing
+# keys/sections fall back to SDS's built-in defaults (the values shown here),
+# and unknown keys are silently ignored rather than erroring. A malformed
+# file prints one warning to stderr at startup and falls back to defaults
+# entirely.
+#
+# Everything here is read once at startup — none of it hot-reloads, you
+# need to restart SDS after editing your config.
+
+# Which color theme to use. "default" and any other name here must match a
+# [name] table in themes.toml (shipped alongside this script) — e.g. try
+# "monokai", "dracula", "nord", or "gruvbox". Add your own to themes.toml
+# without touching this file. An unknown name falls back to "default" with
+# a warning.
+#
+# "custom" is special: instead of using themes.toml, it reads colors
+# straight from the [custom_theme] section below.
+theme = "monokai"
+
+[custom_theme]
+# Only used when theme = "custom" above. Six colors that build SDS's entire
+# UI stylesheet, named by role rather than by their default color — so e.g.
+# changing `accent` away from yellow doesn't leave a variable still called
+# "yellow" holding a green value. Any valid Textual color value works: a hex
+# string ("#rrggbb"), a named color ("red"), or an "rgb(r,g,b)" string.
+accent = "#f5a623"  # borders, active tab, cursor, tree selection
+bg     = "#000000"  # primary background (also the text color on accent-colored surfaces)
+fg     = "#ffffff"  # primary text color
+muted  = "#444444"  # unfocused borders, secondary/dim text
+bg_alt = "#1a1a1a"  # secondary background (gutter, status bar, search bar)
+error  = "#d23c3d"  # error color, and the git "untracked file" indicator
+
+[icons]
+# Glyph style used for file/folder/terminal/pdf icons in the tree and tabs.
+#   "nerdfont" - Nerd Font glyph codepoints (default). Requires a Nerd Font
+#                patched terminal font (e.g. "JetBrainsMono Nerd Font") or
+#                these will render as boxes/garbage.
+#   "ascii"    - plain short ASCII tags (e.g. "PY", "JS", "RS") instead, for
+#                terminals/fonts without Nerd Font glyphs.
+#   "none"     - no icon at all, just the file/folder name.
+style = "nerdfont"
+
+[pdf]
+# How PDF files are displayed.
+#   "auto"  - (default, recommended) SDS detects at startup whether this
+#             terminal supports a real image protocol (Kitty graphics
+#             protocol or Sixel). If yes, PDFs render as rasterized image
+#             pages, same as before. If no (e.g. plain xterm, or output
+#             isn't a real tty), SDS shows each page's extracted plain text
+#             instead of a low-fidelity half-block/unicode approximation.
+#   "image" - always render pages as rasterized images, even if this
+#             terminal can't display them properly.
+#   "text"  - always show extracted plain text, even if image rendering
+#             would work fine.
+mode = "auto"
+
+[keybinds]
+# Global, app-level key bindings. Use Textual key-name syntax:
+# lowercase, "+"-joined modifiers, e.g. "ctrl+s", "alt+escape", "f5",
+# "ctrl+shift+s".
+#
+# Only the keys listed here are configurable in this version of SDS — keys
+# internal to the editor, terminal, and PDF viewer (Ctrl+A, PageUp/PageDown,
+# Shift+PageUp/PageDown, +/- zoom) are not remappable yet.
+#
+# The tree/tab navigation keys default to Alt+<something> — if your window
+# manager uses Alt as its mod key (common on i3/sway/Hyprland-style setups),
+# those combos may never reach SDS at all. Remap them here to something your
+# WM doesn't intercept (e.g. swap to Ctrl+ combos, or unused function keys).
+quit          = "alt+escape"       # quit SDS (with unsaved-changes / confirm prompt)
+save          = "ctrl+s"           # save the active file
+find          = "ctrl+f"           # open find-in-file bar
+new_entry     = "ctrl+n"           # create a new file/directory
+close_tab     = "ctrl+w"           # close the active tab
+leader        = "ctrl+k"           # leader/chord key (leader then c/t/h)
+tree_up       = "alt+up"           # move tree cursor up
+tree_down     = "alt+down"         # move tree cursor down
+tree_collapse = "alt+left"         # collapse the selected directory
+tree_expand   = "alt+right"        # expand the selected directory
+tree_open     = "alt+enter"        # open the selected file
+tree_rename   = "alt+insert"       # rename the selected file/directory
+tree_delete   = "alt+delete"       # delete the selected file/directory
+tab_prev      = "alt+shift+left"   # switch to the previous tab
+tab_next      = "alt+shift+right"  # switch to the next tab
