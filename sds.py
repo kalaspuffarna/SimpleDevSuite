@@ -3,6 +3,7 @@
 import fcntl
 import os
 import pty
+import re
 import shutil
 import signal
 import struct
@@ -553,29 +554,29 @@ def _help_text() -> str:
     return (
         "  SDS — SimpleDevSuite\n\n"
         "  General\n"
-        f"    {k('leader')} then H          this help screen\n"
-        f"    {k('new_entry')}                  new file/dir\n"
-        f"    {k('find')}                  find in file\n"
-        f"    {k('close_tab')}                  close tab\n"
-        f"    {k('save')}                  save\n"
-        f"    {k('quit')}            quit\n\n"
+        f"    this help screen       {k('leader')} then H\n"
+        f"    new file/dir           {k('new_entry')}\n"
+        f"    find in file           {k('find')}\n"
+        f"    close tab              {k('close_tab')}\n"
+        f"    save                   {k('save')}\n"
+        f"    quit                   {k('quit')}\n\n"
         "  File tree\n"
-        f"    {k('tree_up')}/{k('tree_down')}       navigate tree\n"
-        f"    {k('tree_collapse')}/{k('tree_expand')}     collapse / expand dir\n"
-        f"    {k('tree_open')}          open file\n"
-        f"    {k('tree_rename')}         rename file/dir\n"
-        f"    {k('tree_delete')}         delete file/dir\n"
-        f"    {k('tab_prev')}/{k('tab_next')}  switch tabs\n\n"
+        f"    navigate tree           {k('tree_up')}/{k('tree_down')}\n"
+        f"    collapse / expand dir   {k('tree_collapse')}/{k('tree_expand')}\n"
+        f"    open file               {k('tree_open')}\n"
+        f"    rename file/dir         {k('tree_rename')}\n"
+        f"    delete file/dir         {k('tree_delete')}\n"
+        f"    switch tabs             {k('tab_prev')}/{k('tab_next')}\n\n"
         "  Editor\n"
-        "    Ctrl+A                 select all\n"
-        f"    {k('leader')} then C          comment / uncomment selection\n\n"
+        "    select all                      Ctrl+A\n"
+        f"    comment / uncomment selection   {k('leader')} then C\n\n"
         "  Terminal\n"
-        f"    {k('leader')} then T          new terminal\n"
-        "    Shift+PgUp/PgDn         scrollback (mouse wheel also works)\n"
-        "    type 'exit'             close the terminal\n\n"
+        f"    new terminal                          {k('leader')} then T\n"
+        "    scrollback (mouse wheel also works)   Shift+PgUp/PgDn\n"
+        "    close the terminal                    type 'exit'\n\n"
         "  PDF viewer\n"
-        "    PageUp/PageDown         next / previous page\n"
-        "    +/-                     zoom (image mode only)\n"
+        "    next / previous page     PageUp/PageDown\n"
+        "    zoom (image mode only)   +/-\n"
     )
 
 
@@ -645,6 +646,61 @@ _TERM_KEYS = {
     "f5": b"\x1b[15~", "f6": b"\x1b[17~", "f7": b"\x1b[18~", "f8": b"\x1b[19~",
     "f9": b"\x1b[20~", "f10": b"\x1b[21~", "f11": b"\x1b[23~", "f12": b"\x1b[24~",
 }
+
+
+# pyte 0.8.2's CSI parser (see its Stream._csi implementation) has no concept
+# of colon-separated SGR sub-parameters (ITU-T T.416, e.g. `CSI 4:3 m` for a
+# curly underline or `CSI 38:2::r:g:bm` for a colon-form truecolor). The
+# moment it hits a `:` it treats that as the sequence's final byte, no-ops,
+# and aborts — dumping everything after the colon onto the screen as literal
+# text and, worse, silently dropping SGR resets that happen to use colon form
+# (`CSI 4:0 m`), which leaves attributes like underline stuck on forever.
+# Modern shells/prompts/tools that detect an advanced host terminal (e.g. via
+# TERM_PROGRAM=ghostty, which we pass through from the real environment) emit
+# these routinely, so we rewrite them into the plain semicolon form pyte
+# understands before they ever reach it.
+_CSI_COLON_SGR_RE = re.compile(rb"\x1b\[([0-9:;]*)m")
+
+
+def _desub_sgr(data: bytes) -> bytes:
+    """Rewrite colon sub-parameter SGR sequences into pyte-compatible
+    semicolon form, dropping the handful of sub-styles (curly/dotted
+    underline, underline color) pyte has no representation for anyway."""
+    if b":" not in data:
+        return data
+
+    def repl(m: "re.Match[bytes]") -> bytes:
+        params = m.group(1).split(b";")
+        out: list[bytes] = []
+        for param in params:
+            if b":" not in param:
+                out.append(param)
+                continue
+            sub = param.split(b":")
+            head = sub[0]
+            if head == b"4":
+                # Underline style sub-param: `:0` (or blank) means "none".
+                out.append(b"24" if len(sub) > 1 and sub[1] in (b"", b"0") else b"4")
+            elif head in (b"38", b"48"):
+                mode = sub[1] if len(sub) > 1 else b""
+                if mode == b"5" and len(sub) > 2:
+                    out.extend([head, b"5", sub[2]])
+                elif mode == b"2":
+                    # Colorspace-id form has 3 components after the mode
+                    # (colorspace, r, g, b); the common form has just 2.
+                    rgb = sub[-3:] if len(sub) >= 5 else sub[2:5]
+                    if len(rgb) == 3:
+                        out.extend([head, b"2", *rgb])
+                # Unrecognized 38/48 sub-forms are dropped entirely.
+            # Everything else (58 = underline color, and any other unknown
+            # colon code) is dropped entirely rather than risk mis-parsing.
+        if not out:
+            # Emitting a bare `CSI m` would reset all attributes, which is
+            # not what "we dropped an unsupported sub-code" should do.
+            return b""
+        return b"\x1b[" + b";".join(out) + b"m"
+
+    return _CSI_COLON_SGR_RE.sub(repl, data)
 
 
 # ── Pty-backed subprocess — spawns a real shell attached to a pseudo-terminal ─
@@ -786,7 +842,7 @@ class SDSTerminal(Widget):
         self._update_title()
         data = self.pty.read()
         if data:
-            self.vtstream.feed(data)
+            self.vtstream.feed(_desub_sgr(data))
             self.refresh()
         elif not self.pty.is_alive():
             self._dead = True
