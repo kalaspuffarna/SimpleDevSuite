@@ -38,6 +38,11 @@ from rich.markup import escape
 
 TERMINAL_TAB_PREFIX = "\x00terminal\x00"
 
+# Set SDS_DEBUG_TERM_LOG=/some/path to dump every raw byte the embedded
+# terminal reads from its pty (before any of our SGR rewriting) to that file,
+# for diagnosing terminal-emulation bugs offline.
+_TERM_DEBUG_LOG = os.environ.get("SDS_DEBUG_TERM_LOG")
+
 def _is_terminal_tab(path: str) -> bool:
     return path.startswith(TERMINAL_TAB_PREFIX)
 
@@ -853,6 +858,9 @@ class SDSTerminal(Widget):
         self._update_title()
         data = self.pty.read()
         if data:
+            if _TERM_DEBUG_LOG:
+                with open(_TERM_DEBUG_LOG, "ab") as f:
+                    f.write(data)
             self.vtstream.feed(_desub_sgr(data))
             self.refresh()
         elif not self.pty.is_alive():
