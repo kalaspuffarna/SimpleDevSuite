@@ -544,7 +544,19 @@ class SDSTerminal(Widget):
         """Keep pyte's screen dimensions locked to the widget's actual
         rendered content size. Resize events can be missed or fire with a
         stale size during the very first layout pass, so this is re-checked
-        on every poll tick as a cheap, self-healing safety net."""
+        on every poll tick as a cheap, self-healing safety net.
+
+        A widget with `display = False` (e.g. a terminal tab that's
+        currently switched away from) is excluded from layout entirely, so
+        `self.size` collapses to (0, 0) rather than reporting its last real
+        size. Treating that as a genuine resize down to the 10x3 floor
+        would make pyte permanently drop every cell past column 10 (see
+        `Screen.resize`), which can never be recovered when the tab is
+        switched back to — so skip syncing while there's no real size to
+        sync to.
+        """
+        if self.size.width == 0 or self.size.height == 0:
+            return
         cols = max(self.size.width, 10)
         rows = max(self.size.height, 3)
         if (cols, rows) != (self.vt.columns, self.vt.lines):
