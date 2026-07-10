@@ -1,4 +1,0 @@
-textual[syntax]==8.2.8
-pyte==0.8.2
-pymupdf==1.28.0
-textual-image==0.13.2
