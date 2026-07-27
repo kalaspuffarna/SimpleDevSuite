@@ -1382,19 +1382,21 @@ typedef struct {
     Col  kw, type, str, com, num, pre;           /* syntax     */
 } Theme;
 
-/* Tux, the penguin: a black body, a white belly, and an amber beak and feet.
- * That is the whole palette — so the warm amber family carries the language
- * constructs (keywords, types, numbers) and the black-to-white neutral axis
- * carries content and commentary. No greens, cyans or magentas, because Tux
- * does not have any. #f5a623 is the beak. */
+/* Tux chrome, VS Code syntax.
+ *
+ * The UI is the penguin: a black body, a white belly, and the amber beak
+ * (#f5a623) for the accent — tabs, tree selection, line numbers. Carrying
+ * that amber into the syntax colors as well turned the code itself too
+ * yellow, so those follow VS Code's default dark theme instead, which is
+ * both familiar and well separated by hue. */
 static const Theme theme_tux = {
     "tux",
     { 0xf5a623, COLOR_YELLOW }, { 0x000000, COLOR_BLACK },   /* accent, bg    */
     { 0xffffff, COLOR_WHITE  }, { 0x5f5f5f, COLOR_BLUE  },   /* fg,     muted */
     { 0x141414, COLOR_BLACK  }, { 0xe0503a, COLOR_RED   },   /* bg_alt, error */
-    { 0xf5a623, COLOR_YELLOW }, { 0xffd074, COLOR_YELLOW },  /* kw,     type  */
-    { 0xb8b8b8, COLOR_WHITE  }, { 0x555555, COLOR_BLUE   },  /* str,    com   */
-    { 0xe8863a, COLOR_RED    }, { 0x8f8f8f, COLOR_CYAN   },  /* num,    pre   */
+    { 0x569cd6, COLOR_BLUE   }, { 0x4ec9b0, COLOR_CYAN  },   /* kw,     type  */
+    { 0xce9178, COLOR_RED    }, { 0x6a9955, COLOR_GREEN },   /* str,    com   */
+    { 0xb5cea8, COLOR_YELLOW }, { 0xc586c0, COLOR_MAGENTA }, /* num,    pre   */
 };
 
 /* Presets carried over from the Python-era themes.toml. Their syntax colors
@@ -1817,22 +1819,22 @@ static const char *DEFAULT_THEMES =
 "#   kw type str com num pre    syntax: keywords, types, strings,\n"
 "#                              comments, numbers, preprocessor\n"
 "\n"
-"# Tux the penguin: black body, white belly, amber beak and feet — and\n"
-"# nothing else. The warm amber family carries keywords, types and numbers;\n"
-"# the black-to-white neutrals carry text, strings and comments.\n"
+"# Tux chrome with VS Code dark syntax: the UI is the penguin (black body,\n"
+"# white belly, amber beak), while the code itself uses VS Code's default\n"
+"# dark colors, which separate better by hue than an all-amber palette.\n"
 "[tux]\n"
-"accent = \"#f5a623\"  # the beak\n"
+"accent = \"#f5a623\"  # the beak — tabs, tree selection, line numbers\n"
 "bg     = \"#000000\"  # the body\n"
 "fg     = \"#ffffff\"  # the belly\n"
 "muted  = \"#5f5f5f\"\n"
 "bg_alt = \"#141414\"\n"
 "error  = \"#e0503a\"\n"
-"kw     = \"#f5a623\"\n"
-"type   = \"#ffd074\"\n"
-"str    = \"#b8b8b8\"\n"
-"com    = \"#555555\"\n"
-"num    = \"#e8863a\"\n"
-"pre    = \"#8f8f8f\"\n"
+"kw     = \"#569cd6\"  # VS Code blue\n"
+"type   = \"#4ec9b0\"  # teal\n"
+"str    = \"#ce9178\"  # salmon\n"
+"com    = \"#6a9955\"  # green\n"
+"num    = \"#b5cea8\"  # pale green\n"
+"pre    = \"#c586c0\"  # purple\n"
 "\n"
 "# sds's original look, on the eight basic terminal colors.\n"
 "[classic]\n"
