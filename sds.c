@@ -359,7 +359,13 @@ enum { AK_OTHER, AK_TYPE, AK_BS };
 static int brk_y1 = -1, brk_x1, brk_y2, brk_x2;
 
 /* ── utils ────────────────────────────────────────────────────────── */
-static void die(const char *m) { endwin(); fprintf(stderr, "%s\n", m); exit(1); }
+static void tc_restore(void);   /* put back any palette slots we redefined */
+static void die(const char *m) {
+    tc_restore();
+    endwin();
+    fprintf(stderr, "%s\n", m);
+    exit(1);
+}
 static void *xrealloc(void *p, size_t n) {
     void *q = realloc(p, n);
     if (!q) die("out of memory");
@@ -1376,22 +1382,33 @@ typedef struct {
     Col  kw, type, str, com, num, pre;           /* syntax     */
 } Theme;
 
-/* Original sds palette. accent=yellow, dirs/types=cyan, comments=blue …
- * The hex values are the xterm renderings of those basic colors, so truecolor
- * terminals get the same look rather than a different one. */
+/* Tux, the penguin: a black body, a white belly, and an amber beak and feet.
+ * That is the whole palette — so the warm amber family carries the language
+ * constructs (keywords, types, numbers) and the black-to-white neutral axis
+ * carries content and commentary. No greens, cyans or magentas, because Tux
+ * does not have any. #f5a623 is the beak. */
 static const Theme theme_tux = {
     "tux",
-    { 0xf5a623, COLOR_YELLOW  }, { 0x000000, COLOR_BLACK },
-    { 0xffffff, COLOR_WHITE   }, { 0x3465a4, COLOR_BLUE  },
-    { 0x1a1a1a, COLOR_BLACK   }, { 0xd23c3d, COLOR_RED   },
-    { 0xad7fa8, COLOR_MAGENTA }, { 0x34e2e2, COLOR_CYAN  },
-    { 0x8ae234, COLOR_GREEN   }, { 0x3465a4, COLOR_BLUE  },
-    { 0xef2929, COLOR_RED     }, { 0x34e2e2, COLOR_CYAN  },
+    { 0xf5a623, COLOR_YELLOW }, { 0x000000, COLOR_BLACK },   /* accent, bg    */
+    { 0xffffff, COLOR_WHITE  }, { 0x5f5f5f, COLOR_BLUE  },   /* fg,     muted */
+    { 0x141414, COLOR_BLACK  }, { 0xe0503a, COLOR_RED   },   /* bg_alt, error */
+    { 0xf5a623, COLOR_YELLOW }, { 0xffd074, COLOR_YELLOW },  /* kw,     type  */
+    { 0xb8b8b8, COLOR_WHITE  }, { 0x555555, COLOR_BLUE   },  /* str,    com   */
+    { 0xe8863a, COLOR_RED    }, { 0x8f8f8f, COLOR_CYAN   },  /* num,    pre   */
 };
 
 /* Presets carried over from the Python-era themes.toml. Their syntax colors
  * are derived from each palette rather than invented. */
 static const Theme theme_presets[] = {
+    /* sds's pre-theme look: the eight basic terminal colors, kept so the
+     * original appearance is still one config line away. */
+    { "classic",
+      { 0xf5a623, COLOR_YELLOW  }, { 0x000000, COLOR_BLACK },
+      { 0xffffff, COLOR_WHITE   }, { 0x3465a4, COLOR_BLUE  },
+      { 0x1a1a1a, COLOR_BLACK   }, { 0xd23c3d, COLOR_RED   },
+      { 0xad7fa8, COLOR_MAGENTA }, { 0x34e2e2, COLOR_CYAN  },
+      { 0x8ae234, COLOR_GREEN   }, { 0x3465a4, COLOR_BLUE  },
+      { 0xef2929, COLOR_RED     }, { 0x34e2e2, COLOR_CYAN  } },
     { "monokai",
       { 0xfd971f, COLOR_YELLOW  }, { 0x272822, COLOR_BLACK },
       { 0xf8f8f2, COLOR_WHITE   }, { 0x75715e, COLOR_BLUE  },
@@ -1451,14 +1468,79 @@ static int rgb_to_256(int rgb) {
 
     return gd < cd ? 232 + gi : cube;
 }
+/* Exact colors.
+ *
+ * A 256-color terminal can only show the fixed xterm palette, so theme colors
+ * normally snap to the nearest entry (#f5a623 lands on #ffaf00). Most modern
+ * terminals can however be told what a palette slot *means*, which terminfo
+ * reports as `ccc` and ncurses as can_change_color(). When that is available
+ * sds redefines a handful of slots, taken from the top of the palette, to the
+ * theme's exact RGB — and puts them back on exit so the shell's colors are
+ * not left altered.
+ *
+ * Slots are shared with whatever runs in a terminal tab, which is why they
+ * come from the top (the light end of the greyscale ramp, rarely referenced
+ * by name) and why `true_color = off` exists in the config.              */
+#define TC_SLOTS 16
+static int   tc_want = 1;               /* config: 1 = use exact colors */
+static int   tc_on   = 0;               /* resolved at startup */
+static int   tc_rgb[TC_SLOTS];          /* rgb held by each allocated slot */
+static short tc_idx[TC_SLOTS];
+static int   tc_n = 0;
+
+/* The canonical xterm-256 value of a palette index: 16-231 are the 6×6×6
+ * cube, 232-255 the greyscale ramp. Restoring has to be computed like this
+ * rather than read back with color_content(), which only knows the first
+ * few entries and reports nonsense above them — using it would leave the
+ * palette worse than it started. */
+static int xterm256_rgb(int i) {
+    static const int lv[6] = { 0, 95, 135, 175, 215, 255 };
+    if (i >= 232 && i <= 255) { int v = 8 + (i - 232) * 10; return (v << 16) | (v << 8) | v; }
+    if (i >= 16 && i <= 231) {
+        i -= 16;
+        return (lv[i / 36] << 16) | (lv[(i / 6) % 6] << 8) | lv[i % 6];
+    }
+    return 0;
+}
+/* 0-255 to curses' 0-1000, rounded so the value survives the round trip:
+ * terminfo's initc converts back with a truncating (v*255)/1000, so picking
+ * the smallest scaled value that floors to v is what lands exactly on v.
+ * Truncating here instead loses one unit per channel. */
+static short tc_scale(int v) {
+    int x = (v * 1000 + 254) / 255;         /* ceil */
+    return (short)(x > 1000 ? 1000 : x);
+}
+static void tc_set(short idx, int rgb) {
+    init_color(idx, tc_scale(rgb >> 16 & 0xff),
+                    tc_scale(rgb >> 8  & 0xff),
+                    tc_scale(rgb       & 0xff));
+}
+static int tc_alloc(int rgb) {
+    for (int i = 0; i < tc_n; i++) if (tc_rgb[i] == rgb) return tc_idx[i];
+    if (tc_n >= TC_SLOTS) return rgb_to_256(rgb);      /* out of slots */
+    short idx = (short)(COLORS - 1 - tc_n);
+    if (idx < 16 || idx > 255) return rgb_to_256(rgb);
+    tc_set(idx, rgb);
+    tc_rgb[tc_n] = rgb;
+    tc_idx[tc_n] = idx;
+    tc_n++;
+    return idx;
+}
+/* hand the palette back the way a 256-color terminal defines it */
+static void tc_restore(void) {
+    for (int i = 0; i < tc_n; i++) tc_set(tc_idx[i], xterm256_rgb(tc_idx[i]));
+    tc_n = 0;
+}
 /* map a theme color onto whatever this terminal can actually show */
 static int col_of(Col c) {
-    if (COLORS >= (1 << 24)) return c.rgb;      /* direct/truecolor terminfo */
-    if (COLORS >= 256)       return rgb_to_256(c.rgb);
+    if (tc_on)         return tc_alloc(c.rgb);
+    if (COLORS >= 256) return rgb_to_256(c.rgb);
     return c.basic;
 }
 static void apply_theme(void) {
     if (!has_colors()) return;
+    tc_restore();                       /* re-theming reuses the same slots */
+    tc_on = tc_want && can_change_color() && COLORS >= 256;
     int bg = col_of(theme.bg), fg = col_of(theme.fg);
     /* -1 keeps the terminal's own background, which is what sds did before and
      * what makes transparent terminals look right */
@@ -1663,10 +1745,18 @@ static const char *DEFAULT_CONFIG =
 "# to the built-in default shown here. Unknown keys are ignored rather than\n"
 "# treated as errors. Nothing hot-reloads; restart sds after editing.\n"
 "\n"
-"# Color theme. \"tux\" is sds's original palette. Other built-ins: monokai,\n"
-"# dracula, nord, gruvbox. Any [name] table in the `themes` file next to this\n"
-"# one also works, and overrides a built-in of the same name.\n"
+"# Color theme. \"tux\" is black/white/amber after the penguin. \"classic\" is\n"
+"# sds's original eight-color look. Also built in: monokai, dracula, nord,\n"
+"# gruvbox. Any [name] table in the `themes` file next to this one also\n"
+"# works, and overrides a built-in of the same name.\n"
 "theme = \"tux\"\n"
+"\n"
+"# Show the theme's exact colors instead of snapping them to the terminal's\n"
+"# fixed 256-color palette. Needs a terminal that allows redefining palette\n"
+"# entries (terminfo `ccc`); sds detects that and quietly falls back if not.\n"
+"# It borrows a few slots from the top of the palette and restores them on\n"
+"# exit. Set to off if colors inside terminal tabs look wrong.\n"
+"true_color = on\n"
 "\n"
 "[editor]\n"
 "tab_width = 4        # render width of a tab character (1-16)\n"
@@ -1727,7 +1817,25 @@ static const char *DEFAULT_THEMES =
 "#   kw type str com num pre    syntax: keywords, types, strings,\n"
 "#                              comments, numbers, preprocessor\n"
 "\n"
+"# Tux the penguin: black body, white belly, amber beak and feet — and\n"
+"# nothing else. The warm amber family carries keywords, types and numbers;\n"
+"# the black-to-white neutrals carry text, strings and comments.\n"
 "[tux]\n"
+"accent = \"#f5a623\"  # the beak\n"
+"bg     = \"#000000\"  # the body\n"
+"fg     = \"#ffffff\"  # the belly\n"
+"muted  = \"#5f5f5f\"\n"
+"bg_alt = \"#141414\"\n"
+"error  = \"#e0503a\"\n"
+"kw     = \"#f5a623\"\n"
+"type   = \"#ffd074\"\n"
+"str    = \"#b8b8b8\"\n"
+"com    = \"#555555\"\n"
+"num    = \"#e8863a\"\n"
+"pre    = \"#8f8f8f\"\n"
+"\n"
+"# sds's original look, on the eight basic terminal colors.\n"
+"[classic]\n"
 "accent = \"#f5a623\"\n"
 "bg     = \"#000000\"\n"
 "fg     = \"#ffffff\"\n"
@@ -1859,6 +1967,9 @@ static void cfg_load(void) {
 
                 if (!sect[0] && !strcmp(k, "theme")) {
                     snprintf(want, sizeof want, "%s", v);
+                } else if (!sect[0] && !strcmp(k, "true_color")) {
+                    tc_want = !(!strcmp(v, "false") || !strcmp(v, "off") ||
+                                !strcmp(v, "0"));
                 } else if (!strcmp(sect, "editor")) {
                     if (!strcmp(k, "tab_width")) {
                         int n = atoi(v);
@@ -4135,6 +4246,7 @@ static void run_command(void) {
         if (tabs[i]->dirty && buf_save(tabs[i]) == 0) saved++;
 
     def_prog_mode();
+    tc_restore();                       /* the command gets the real palette */
     endwin();
     printf("\033[?2004l");
     printf("\033[H\033[2J\033[3J");     /* clear screen + scrollback */
@@ -4153,6 +4265,7 @@ static void run_command(void) {
     fflush(stdout);
 
     reset_prog_mode();
+    apply_theme();                    /* and sds takes its palette back */
     printf("\033[?2004h");
     fflush(stdout);
     getch();                          /* any key, not just Enter */
@@ -4527,6 +4640,8 @@ int main(int argc, char **argv) {
         }
     }
 done:
+    tc_restore();               /* leave the terminal's palette as we found it */
+    refresh();
     printf("\033[?2004l");
     fflush(stdout);
     endwin();
