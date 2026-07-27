@@ -1,10 +1,15 @@
 /* sds.c — SimpleDevSuite v2
  *
- * A small terminal code editor inspired by VS Code:
+ * A small terminal dev environment inspired by VS Code:
  *
- *   - file tree (left), tab bar (top), editor with line numbers, status bar
+ *   - file tree (left, collapsible), tab bar (top), editor with line
+ *     numbers, status bar
  *   - syntax highlighting: C, C++, Python, Bash, Rust, SQL, JS/TS, Go,
- *     Java, Lua, Ruby, PHP, JSON, TOML/YAML/INI, Makefile
+ *     Java, Lua, Ruby, PHP, JSON, TOML/YAML/INI, Makefile — optionally
+ *     via tree-sitter when a grammar is installed (see below)
+ *   - embedded pty terminal tabs (Alt+T) with scrollback and colors
+ *   - git status markers in the tree and the branch in the status bar
+ *   - config file and themes under ~/.config/sds/
  *   - undo/redo, selections, clipboard (with OSC 52 system-clipboard copy)
  *   - incremental find, replace, go-to-line
  *   - fuzzy quick-open (Ctrl+P), word-based autocomplete (Ctrl+Space)
@@ -14,33 +19,66 @@
  *
  * The mod key is Alt for app-level things; editing chords follow VS Code
  * where the terminal allows (see Alt+H in the app for the full list).
+ * App-level keys are remappable in the config.
  *
- * Build:   cc -O2 -Wall -o sds sds.c -lncursesw
+ * Build:   cc -O2 -Wall -o sds sds.c -lncursesw -lutil
+ *   with tree-sitter (optional, adds semantic highlighting):
+ *          cc -O2 -Wall -DSDS_TREESITTER -o sds sds.c \
+ *             $(pkg-config --cflags --libs tree-sitter) -lncursesw -lutil -ldl
+ *   ./install.sh picks whichever of those applies automatically.
+ *
  * Run:     ./sds [directory]
+ *          ./sds --fetch-grammar cpp     install a tree-sitter grammar
  *
- * Known simplifications: editing is byte-based (UTF-8 loads/saves fine,
- * cursor steps per byte); no multi-cursor; no LSP.
+ * Tree-sitter is strictly optional and loaded at runtime: grammars live in
+ * ~/.local/share/sds/grammars with their highlight queries beside them in
+ * ~/.local/share/sds/queries. Any language without an installed grammar —
+ * or the whole editor, when built without -DSDS_TREESITTER — falls back to
+ * the built-in keyword lexer, which handles every language listed above.
+ *
+ * Known simplifications: editing is byte-based, so while the cursor will
+ * not split a multi-byte character, wide (CJK) glyphs still count as one
+ * column and can shift the rendering of a line; no multi-cursor; no LSP.
+ * The terminal does not implement mouse reporting or sixel graphics.
  */
 
 #define _XOPEN_SOURCE 700
 #include <ctype.h>
 #include <dirent.h>
+#include <errno.h>
 #include <limits.h>
 #include <locale.h>
 #include <ncurses.h>
+#include <fcntl.h>
+#include <pty.h>
+#include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/ioctl.h>
+#include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#ifdef SDS_TREESITTER
+#include <dlfcn.h>
+#include <tree_sitter/api.h>
+#endif
 
-#define TABSTOP    4
-#define TREE_W     30
 #define MAX_TABS   32
 #define UNDO_MAX   2000
 #define QO_MAX     10000   /* quick-open file cap */
+#define TABSTOP_MAX 16     /* upper bound on the configurable tab width */
+
+/* Runtime-configurable (see ~/.config/sds/config). Both were compile-time
+ * constants before the config system; they are still fixed after startup, so
+ * buffers sized against them only need to allow for TABSTOP_MAX. */
+static int tabstop = 4;            /* render width of a tab character */
+static int tree_w  = 30;           /* file-tree sidebar width in columns */
+static int tree_autohide = 80;     /* hide the sidebar below this COLS (0=never) */
+static int tree_hidden = 0;        /* sidebar currently folded away */
 
 /* ── key codes ────────────────────────────────────────────────────── */
 /* Modified arrows/home/end arrive as CSI "1;<mod><dir>"; we register
@@ -51,6 +89,7 @@
 enum { D_UP, D_DOWN, D_LEFT, D_RIGHT, D_HOME, D_END };
 enum { K_PSTART = 2900, K_PEND, K_ADEL, K_AINS, K_NONE };
 #define ALT(c)  (3000 + (c))
+#undef  CTRL                      /* sys/ttydefaults.h (via pty.h) defines it */
 #define CTRL(c) ((c) & 0x1f)
 
 /* ── languages ────────────────────────────────────────────────────── */
@@ -77,20 +116,38 @@ static const Lang langs[] = {
   { "c", " c h ",
     " if else for while do switch case default return goto break continue"
     " sizeof typedef struct union enum const static extern inline volatile"
-    " register restrict ",
+    " register restrict auto alignas alignof static_assert thread_local"
+    " typeof typeof_unqual _Alignas _Alignof _Atomic _Generic _Noreturn"
+    " _Static_assert _Thread_local defer ",
     " void char short int long float double signed unsigned bool _Bool"
-    " size_t ssize_t int8_t int16_t int32_t int64_t uint8_t uint16_t"
-    " uint32_t uint64_t FILE NULL true false ",
+    " _BitInt _Complex _Decimal32 _Decimal64 _Decimal128 _Imaginary"
+    " size_t ssize_t ptrdiff_t intptr_t uintptr_t intmax_t uintmax_t"
+    " wchar_t char8_t char16_t char32_t va_list"
+    " int8_t int16_t int32_t int64_t uint8_t uint16_t uint32_t uint64_t"
+    " int_least8_t int_least16_t int_least32_t int_least64_t"
+    " int_fast8_t int_fast16_t int_fast32_t int_fast64_t"
+    " FILE NULL true false nullptr errno ",
     "//", "", "/*", "*/", "", "", 0, 1, 0, 1, 0 },
-  { "c++", " cpp cc cxx hpp hh hxx ",
+  { "c++", " cpp cc cxx c++ hpp hh hxx h++ ipp tpp cu cuh ",
     " if else for while do switch case default return goto break continue"
     " sizeof typedef struct union enum const static extern inline volatile"
     " class namespace template typename public private protected virtual"
     " override final new delete this try catch throw using constexpr"
     " operator friend explicit mutable noexcept static_cast dynamic_cast"
-    " reinterpret_cast const_cast decltype ",
+    " reinterpret_cast const_cast decltype register restrict volatile"
+    /* C++20/23: concepts, coroutines, modules — the gap that prompted this */
+    " concept requires co_await co_yield co_return consteval constinit"
+    " module import export "
+    " alignas alignof static_assert thread_local typeid asm goto"
+    " and and_eq bitand bitor compl not not_eq or or_eq xor xor_eq"
+    " if_constexpr inline extern explicit ",
     " void char short int long float double signed unsigned bool auto"
-    " size_t std string vector map set pair nullptr true false NULL ",
+    " char8_t char16_t char32_t wchar_t size_t ssize_t ptrdiff_t nullptr_t"
+    " int8_t int16_t int32_t int64_t uint8_t uint16_t uint32_t uint64_t"
+    " std string string_view vector map unordered_map set unordered_set"
+    " pair tuple array deque list optional variant any span"
+    " unique_ptr shared_ptr weak_ptr function initializer_list"
+    " nullptr true false NULL ",
     "//", "", "/*", "*/", "", "", 0, 1, 0, 1, 0 },
   { "python", " py pyw ",
     " False None True and as assert async await break class continue def"
@@ -199,19 +256,26 @@ static const Lang langs[] = {
     " ", "#", "", "", "", "", "", 0, 0, 0, 0, 0 },
   { "text", "", " ", " ", "", "", "", "", "", "", 0, 0, 0, 0, 0 },
 };
-#define LANG_TEXT (&langs[sizeof langs / sizeof *langs - 1])
+#define NLANGS ((int)(sizeof langs / sizeof *langs))
+#define LANG_TEXT (&langs[NLANGS - 1])
 
+static const Lang *lang_by_name(const char *name) {
+    for (int i = 0; i < NLANGS; i++)
+        if (!strcmp(langs[i].name, name)) return &langs[i];
+    return LANG_TEXT;
+}
 static const Lang *lang_for(const char *path) {
     const char *base = strrchr(path, '/');
     base = base ? base + 1 : path;
     if (!strcasecmp(base, "Makefile") || !strcasecmp(base, "GNUmakefile"))
-        return &langs[16];
+        return lang_by_name("make");
+    if (!strcasecmp(base, "CMakeLists.txt")) return lang_by_name("make");
     const char *dot = strrchr(base, '.');
     if (!dot || !dot[1]) return LANG_TEXT;
     char pat[32];
     snprintf(pat, sizeof pat, " %s ", dot + 1);
     for (char *p = pat; *p; p++) *p = (char)tolower((unsigned char)*p);
-    for (size_t i = 0; i + 1 < sizeof langs / sizeof *langs; i++)
+    for (int i = 0; i + 1 < NLANGS; i++)
         if (strstr(langs[i].exts, pat)) return &langs[i];
     return LANG_TEXT;
 }
@@ -233,7 +297,12 @@ typedef struct {
 } URec;
 enum { U_INS, U_DEL };
 
+typedef struct Term Term;
+enum { TAB_FILE, TAB_TERM };
+
 typedef struct {
+    int   kind;                /* TAB_FILE or TAB_TERM */
+    Term *term;                /* set when kind == TAB_TERM */
     char  path[PATH_MAX];
     char  name[NAME_MAX + 1];
     const Lang *lang;
@@ -247,6 +316,15 @@ typedef struct {
     int   hl_upto;             /* lines with valid hst: [0, hl_upto] */
     URec *undo; int nundo;
     URec *redo; int nredo;
+    int   ver;                 /* bumped on every edit; drives reparse/caches */
+#ifdef SDS_TREESITTER
+    TSParser *ts_parser;
+    TSTree   *ts_tree;
+    uint32_t *ts_off;          /* byte offset of each line start */
+    uint32_t  ts_bytes;
+    int       ts_off_dirty;
+    int       ts_ver;          /* `ver` the current tree was parsed from */
+#endif
 } Buf;
 
 /* ── file tree ────────────────────────────────────────────────────── */
@@ -324,13 +402,24 @@ static void buf_del_line(Buf *b, int at) {
     memmove(b->ln + at, b->ln + at + 1, (size_t)(b->n - at - 1) * sizeof(Line));
     b->n--;
 }
+static void term_free(Term *t);
 static void urec_free(URec *r) { free(r->t); }
+#ifdef SDS_TREESITTER
+static void ts_forget(Buf *b);      /* drops any cached spans pointing at b */
+#endif
 static void buf_free(Buf *b) {
     for (int i = 0; i < b->n; i++) free(b->ln[i].s);
     for (int i = 0; i < b->nundo; i++) urec_free(&b->undo[i]);
     for (int i = 0; i < b->nredo; i++) urec_free(&b->redo[i]);
     free(b->undo); free(b->redo);
     free(b->ln);
+    if (b->term) term_free(b->term);
+#ifdef SDS_TREESITTER
+    ts_forget(b);
+    if (b->ts_tree)   ts_tree_delete(b->ts_tree);
+    if (b->ts_parser) ts_parser_delete(b->ts_parser);
+    free(b->ts_off);
+#endif
     free(b);
 }
 static Buf *buf_load(const char *path) {
@@ -365,10 +454,50 @@ static int buf_save(Buf *b) {
 }
 
 /* ── raw edit primitives (no undo recording) ──────────────────────── */
-static void hl_invalidate(Buf *b, int y) { if (y < b->hl_upto) b->hl_upto = y; }
+/* Called from every edit path, so this is where the buffer version — and with
+ * it the tree-sitter reparse and span cache — gets invalidated. */
+static void hl_invalidate(Buf *b, int y) {
+    if (y < b->hl_upto) b->hl_upto = y;
+    b->ver++;
+#ifdef SDS_TREESITTER
+    b->ts_off_dirty = 1;
+#endif
+}
+
+#ifdef SDS_TREESITTER
+static void ts_offsets(Buf *b);
+/* Byte offset of (y,x). Callers must use it before mutating the buffer —
+ * the offset table describes the text as it currently stands. */
+static uint32_t ts_byte_at(Buf *b, int y, int x) {
+    ts_offsets(b);
+    if (y < 0) return 0;
+    if (y >= b->n) return b->ts_bytes;
+    return b->ts_off[y] + (uint32_t)x;
+}
+/* Tell tree-sitter what changed so the next parse can reuse the old tree.
+ * Without this a full reparse runs on every keystroke, which measured ~88ms
+ * on a 3.7k-line file; with it, parsing is proportional to the edit. */
+static void ts_note_edit(Buf *b, uint32_t sb, uint32_t ob, uint32_t nb,
+                         int sy, int sx, int oy, int ox, int ny, int nx) {
+    b->ts_off_dirty = 1;
+    if (!b->ts_tree) return;
+    TSInputEdit e;
+    e.start_byte   = sb;
+    e.old_end_byte = ob;
+    e.new_end_byte = nb;
+    e.start_point    = (TSPoint){ (uint32_t)sy, (uint32_t)sx };
+    e.old_end_point  = (TSPoint){ (uint32_t)oy, (uint32_t)ox };
+    e.new_end_point  = (TSPoint){ (uint32_t)ny, (uint32_t)nx };
+    ts_tree_edit(b->ts_tree, &e);
+}
+#endif
 
 static void ins_text(Buf *b, int y, int x, const char *t, int len,
                      int *ey, int *ex) {
+#ifdef SDS_TREESITTER
+    int sy = y, sx = x;
+    uint32_t sb = ts_byte_at(b, y, x);
+#endif
     int i = 0;
     while (i < len) {
         int j = i;
@@ -388,6 +517,9 @@ static void ins_text(Buf *b, int y, int x, const char *t, int len,
         }
         i = j + 1;
     }
+#ifdef SDS_TREESITTER
+    ts_note_edit(b, sb, sb, sb + (uint32_t)len, sy, sx, sy, sx, y, x);
+#endif
     if (ey) *ey = y;
     if (ex) *ex = x;
 }
@@ -410,6 +542,10 @@ static char *range_text(Buf *b, int y1, int x1, int y2, int x2, int *outlen) {
     return t;
 }
 static void del_range_raw(Buf *b, int y1, int x1, int y2, int x2) {
+#ifdef SDS_TREESITTER
+    uint32_t sb = ts_byte_at(b, y1, x1), ob = ts_byte_at(b, y2, x2);
+    ts_note_edit(b, sb, ob, sb, y1, x1, y2, x2, y1, x1);
+#endif
     if (y1 == y2) {
         Line *l = &b->ln[y1];
         memmove(l->s + x1, l->s + x2, (size_t)(l->len - x2));
@@ -541,10 +677,14 @@ static void sel_delete(Buf *b) {             /* assumes active selection */
 /* ── tabs ─────────────────────────────────────────────────────────── */
 static void open_file(const char *path) {
     for (int i = 0; i < ntabs; i++)
-        if (strcmp(tabs[i]->path, path) == 0) { cur = i; return; }
+        if (tabs[i]->kind == TAB_FILE && strcmp(tabs[i]->path, path) == 0) {
+            cur = i;
+            return;
+        }
     if (ntabs == MAX_TABS) { set_msg("too many open tabs", NULL); return; }
     Buf *b = buf_load(path);
     if (!b) { set_msg("can't open %s", path); return; }
+    b->kind = TAB_FILE;
     tabs[ntabs] = b;
     cur = ntabs++;
 }
@@ -666,16 +806,30 @@ static void tree_open_selected(void) {
         tree_rebuild();
     } else open_file(n->path);
 }
+static void tree_toggle(void) {
+    tree_hidden = !tree_hidden;
+    set_msg(tree_hidden ? "sidebar hidden" : "sidebar shown", NULL);
+}
+/* Collapse one level. Collapsing when there is nothing left to collapse —
+ * a top-level entry, already folded — folds the sidebar itself away, so
+ * repeated Alt+Left in the root directory reclaims the whole width. */
 static void tree_collapse(void) {
-    if (nvis == 0) return;
+    if (tree_hidden) return;
+    if (nvis == 0) { tree_hidden = 1; return; }
     Node *n = vis[tsel];
-    if (n->is_dir && n->expanded) { n->expanded = 0; tree_rebuild(); }
-    else if (n->parent && n->parent != root)
+    if (n->is_dir && n->expanded) { n->expanded = 0; tree_rebuild(); return; }
+    if (n->parent && n->parent != root) {
         for (int i = 0; i < nvis; i++)
             if (vis[i] == n->parent) { tsel = i; break; }
+        return;
+    }
+    tree_hidden = 1;
+    set_msg("sidebar hidden — Alt+Right or Alt+B to bring it back", NULL);
 }
+static void git_refresh(void);
 /* rescan the whole tree, keeping the cursor on the same path if it survived */
 static void tree_refresh(void) {
+    git_refresh();
     char keep[PATH_MAX] = "";
     if (nvis) snprintf(keep, sizeof keep, "%s", vis[tsel]->path);
     node_refresh(root);
@@ -686,21 +840,64 @@ static void tree_refresh(void) {
     if (tsel >= nvis) tsel = max2(0, nvis - 1);
 }
 static void tree_expand(void) {
+    if (tree_hidden) { tree_hidden = 0; return; }   /* first Alt+Right un-hides */
     if (nvis == 0) return;
     Node *n = vis[tsel];
     if (n->is_dir && !n->expanded) { n->expanded = 1; node_load(n); tree_rebuild(); }
 }
 
 /* ── lexer ────────────────────────────────────────────────────────── */
+/* The keyword lists are written as readable space-delimited strings, but
+ * scanning them with strstr for every identifier on every visible line got
+ * expensive as the lists grew. Split them once into sorted arrays and binary
+ * search instead, so adding keywords stays free. */
+typedef struct { const char *w; int len; } Kw;
+static struct { Kw *kw; int nkw; Kw *ty; int nty; } kwidx[NLANGS];
+static int kw_cmp(const void *a, const void *b) {
+    const Kw *x = a, *y = b;
+    int n = x->len < y->len ? x->len : y->len;
+    int c = memcmp(x->w, y->w, (size_t)n);
+    if (c) return c;
+    return x->len - y->len;
+}
+static void kw_split(const char *src, Kw **out, int *nout) {
+    int n = 0, cap = 16;
+    Kw *v = xmalloc((size_t)cap * sizeof *v);
+    const char *p = src;
+    while (*p) {
+        while (*p == ' ') p++;
+        if (!*p) break;
+        const char *s = p;
+        while (*p && *p != ' ') p++;
+        if (n == cap) { cap *= 2; v = xrealloc(v, (size_t)cap * sizeof *v); }
+        v[n].w = s;
+        v[n].len = (int)(p - s);
+        n++;
+    }
+    qsort(v, (size_t)n, sizeof *v, kw_cmp);
+    *out = v; *nout = n;
+}
+static void kw_index_build(void) {
+    for (int i = 0; i < NLANGS; i++) {
+        kw_split(langs[i].kw,    &kwidx[i].kw, &kwidx[i].nkw);
+        kw_split(langs[i].types, &kwidx[i].ty, &kwidx[i].nty);
+    }
+}
 static int kw_class(const Lang *lg, const char *s, int len) {
-    char pat[72];
+    char buf[64];
     if (len > 63) return HA_DEF;
-    pat[0] = ' ';
-    for (int i = 0; i < len; i++)
-        pat[1 + i] = lg->nocase ? (char)tolower((unsigned char)s[i]) : s[i];
-    pat[1 + len] = ' '; pat[2 + len] = 0;
-    if (lg->kw[0] && strstr(lg->kw, pat)) return HA_KW;
-    if (lg->types[0] && strstr(lg->types, pat)) return HA_TYPE;
+    /* nocase languages (SQL) keep their tables lowercase, so fold the token */
+    if (lg->nocase) {
+        for (int i = 0; i < len; i++) buf[i] = (char)tolower((unsigned char)s[i]);
+        s = buf;
+    }
+    int li = (int)(lg - langs);
+    if (li < 0 || li >= NLANGS) return HA_DEF;
+    Kw key = { s, len };
+    if (kwidx[li].nkw && bsearch(&key, kwidx[li].kw, (size_t)kwidx[li].nkw,
+                                 sizeof(Kw), kw_cmp)) return HA_KW;
+    if (kwidx[li].nty && bsearch(&key, kwidx[li].ty, (size_t)kwidx[li].nty,
+                                 sizeof(Kw), kw_cmp)) return HA_TYPE;
     return HA_DEF;
 }
 static int tok_at(const char *s, int len, int i, const char *tok) {
@@ -831,21 +1028,1481 @@ static void ensure_hl(Buf *b, int upto) {
     if (upto > b->hl_upto) b->hl_upto = upto;
 }
 
-/* ── rendering ────────────────────────────────────────────────────── */
+/* ── tree-sitter (optional) ───────────────────────────────────────── */
+/* Built only with -DSDS_TREESITTER. Grammars are dlopen'd at runtime rather
+ * than linked, so sds keeps working when a language's grammar is missing —
+ * it just falls back to the keyword lexer above. Nothing here is required
+ * for sds to build or run.
+ *
+ *   grammars: $XDG_DATA_HOME/sds/grammars/libtree-sitter-<lang>.so, then
+ *             the usual system library directories
+ *   queries:  $XDG_DATA_HOME/sds/queries/<lang>/highlights.scm
+ *
+ * `sds --fetch-grammar <lang>` builds and installs both.                  */
+#ifdef SDS_TREESITTER
+typedef struct {
+    char         name[24];
+    const TSLanguage *lang;
+    TSQuery     *query;
+    unsigned char *cap;        /* query capture index → HA_* */
+    int          tried;        /* load attempted; don't retry every keystroke */
+} TSGram;
+
+static TSGram tsgram[NLANGS];
+
+/* sds language name → tree-sitter grammar name (mostly identity) */
+static const char *ts_name_of(const Lang *lg) {
+    if (!strcmp(lg->name, "c++"))  return "cpp";
+    if (!strcmp(lg->name, "make")) return "make";
+    if (!strcmp(lg->name, "text")) return NULL;
+    return lg->name;
+}
+/* tree-sitter capture names are dotted and open-ended ("keyword.coroutine",
+ * "type.builtin", …); classify on the leading component. */
+static unsigned char ts_cap_attr(const char *nm, uint32_t len) {
+    char b[64];
+    uint32_t n = len < sizeof b - 1 ? len : (uint32_t)sizeof b - 1;
+    memcpy(b, nm, n); b[n] = 0;
+    char *dot = strchr(b, '.');
+    if (dot) *dot = 0;
+    if (!strcmp(b, "keyword"))                          return HA_KW;
+    if (!strcmp(b, "type") || !strcmp(b, "constructor")) return HA_TYPE;
+    if (!strcmp(b, "function") || !strcmp(b, "method")) return HA_TYPE;
+    if (!strcmp(b, "string") || !strcmp(b, "character")) return HA_STR;
+    if (!strcmp(b, "comment"))                          return HA_COM;
+    if (!strcmp(b, "number") || !strcmp(b, "float"))    return HA_NUM;
+    if (!strcmp(b, "preproc") || !strcmp(b, "keyword_directive")) return HA_PRE;
+    if (!strcmp(b, "constant")) {
+        return (dot && !strcmp(dot + 1, "numeric")) ? HA_NUM : HA_TYPE;
+    }
+    return HA_DEF;
+}
+static void ts_data_dir(char *out, size_t cap, const char *sub) {
+    const char *xdg = getenv("XDG_DATA_HOME"), *home = getenv("HOME");
+    if (xdg && *xdg) snprintf(out, cap, "%s/sds/%s", xdg, sub);
+    else if (home && *home) snprintf(out, cap, "%s/.local/share/sds/%s", home, sub);
+    else snprintf(out, cap, "./%s", sub);
+}
+static char *slurp(const char *path, uint32_t *len) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    if (n < 0 || n > (1 << 22)) { fclose(f); return NULL; }
+    rewind(f);
+    char *s = xmalloc((size_t)n + 1);
+    size_t got = fread(s, 1, (size_t)n, f);
+    fclose(f);
+    s[got] = 0;
+    *len = (uint32_t)got;
+    return s;
+}
+/* A grammar's highlight query is usually only the part that differs from a
+ * base language: tree-sitter-cpp's file has no rules for `int` or `char8_t`
+ * because those live in tree-sitter-c's. Upstream expresses that with a
+ * "; inherits: c" comment (which not every repo actually includes), so honor
+ * the directive and also fall back to a known parent per language. */
+static const char *ts_parent_of(const char *nm) {
+    if (!strcmp(nm, "cpp"))        return "c";
+    if (!strcmp(nm, "typescript")) return "javascript";
+    if (!strcmp(nm, "tsx"))        return "typescript";
+    return NULL;
+}
+/* Read <nm>'s query, prefixed by whatever it inherits. Depth-capped so a
+ * malformed inherits cycle cannot recurse forever. */
+static char *ts_query_src(const char *nm, uint32_t *outlen, int depth) {
+    char dir[PATH_MAX - 64], path[PATH_MAX];
+    ts_data_dir(dir, sizeof dir, "queries");
+    snprintf(path, sizeof path, "%s/%s/highlights.scm", dir, nm);
+    uint32_t len = 0;
+    char *own = slurp(path, &len);
+    if (!own) return NULL;
+    if (depth >= 4) { *outlen = len; return own; }
+
+    /* explicit "; inherits: a,b" on one of the first lines */
+    char parents[128] = "";
+    const char *ih = strstr(own, "inherits:");
+    if (ih && ih - own < 200) {
+        ih += 9;
+        while (*ih == ' ') ih++;
+        size_t k = 0;
+        while (*ih && *ih != '\n' && k + 1 < sizeof parents) parents[k++] = *ih++;
+        parents[k] = 0;
+    }
+    if (!parents[0]) {
+        const char *p = ts_parent_of(nm);
+        if (p) snprintf(parents, sizeof parents, "%s", p);
+    }
+    if (!parents[0]) { *outlen = len; return own; }
+
+    /* concatenate each parent's query ahead of this one */
+    char *acc = NULL;
+    uint32_t acclen = 0;
+    char *save = NULL;
+    for (char *tok = strtok_r(parents, ", \t", &save); tok;
+         tok = strtok_r(NULL, ", \t", &save)) {
+        if (!strcmp(tok, nm)) continue;
+        uint32_t plen = 0;
+        char *ps = ts_query_src(tok, &plen, depth + 1);
+        if (!ps) continue;
+        acc = xrealloc(acc, acclen + plen + 2);
+        memcpy(acc + acclen, ps, plen);
+        acclen += plen;
+        acc[acclen++] = '\n';
+        free(ps);
+    }
+    if (!acc) { *outlen = len; return own; }
+    acc = xrealloc(acc, acclen + len + 1);
+    memcpy(acc + acclen, own, len);
+    acclen += len;
+    acc[acclen] = 0;
+    free(own);
+    *outlen = acclen;
+    return acc;
+}
+/* Load grammar + highlight query for `lg`, once. Returns NULL if either is
+ * unavailable, which simply means this buffer keeps using the lexer. */
+static TSGram *ts_for(const Lang *lg) {
+    int li = (int)(lg - langs);
+    if (li < 0 || li >= NLANGS) return NULL;
+    TSGram *g = &tsgram[li];
+    if (g->tried) return g->lang && g->query ? g : NULL;
+    g->tried = 1;
+
+    const char *nm = ts_name_of(lg);
+    if (!nm) return NULL;
+    snprintf(g->name, sizeof g->name, "%s", nm);
+
+    /* the directory is bounded well below PATH_MAX so the composed paths
+     * below always fit — sized explicitly to keep -Wformat-truncation quiet */
+    char dir[PATH_MAX - 64], sym[64];
+    ts_data_dir(dir, sizeof dir, "grammars");
+    const char *cands[4];
+    char c0[PATH_MAX], c1[64 + 24], c2[64 + 24];
+    snprintf(c0, sizeof c0, "%s/libtree-sitter-%s.so", dir, nm);
+    snprintf(c1, sizeof c1, "libtree-sitter-%s.so", nm);        /* ld.so path */
+    snprintf(c2, sizeof c2, "/usr/lib/libtree-sitter-%s.so", nm);
+    cands[0] = c0; cands[1] = c1; cands[2] = c2; cands[3] = NULL;
+
+    void *dl = NULL;
+    for (int i = 0; cands[i] && !dl; i++) dl = dlopen(cands[i], RTLD_LAZY | RTLD_LOCAL);
+    if (!dl) return NULL;
+
+    snprintf(sym, sizeof sym, "tree_sitter_%s", nm);
+    const TSLanguage *(*fn)(void) = (const TSLanguage *(*)(void))
+        (uintptr_t)dlsym(dl, sym);
+    if (!fn) { dlclose(dl); return NULL; }
+    g->lang = fn();
+    if (!g->lang) { dlclose(dl); return NULL; }
+
+    uint32_t qlen = 0;
+    char *src = ts_query_src(nm, &qlen, 0);
+    if (!src) { g->lang = NULL; dlclose(dl); return NULL; }
+
+    uint32_t erroff; TSQueryError errtype;
+    g->query = ts_query_new(g->lang, src, qlen, &erroff, &errtype);
+    free(src);
+    if (!g->query) {
+        /* An inherited query can reference node types this grammar does not
+         * have, which fails the whole compile. Retry with just this
+         * language's own rules before giving up on tree-sitter entirely. */
+        char dir[PATH_MAX - 64], path[PATH_MAX];
+        ts_data_dir(dir, sizeof dir, "queries");
+        snprintf(path, sizeof path, "%s/%s/highlights.scm", dir, nm);
+        src = slurp(path, &qlen);
+        if (src) {
+            g->query = ts_query_new(g->lang, src, qlen, &erroff, &errtype);
+            free(src);
+        }
+    }
+    if (!g->query) { g->lang = NULL; dlclose(dl); return NULL; }
+
+    uint32_t nc = ts_query_capture_count(g->query);
+    g->cap = xmalloc(nc ? nc : 1);
+    for (uint32_t i = 0; i < nc; i++) {
+        uint32_t l;
+        const char *cn = ts_query_capture_name_for_id(g->query, i, &l);
+        g->cap[i] = ts_cap_attr(cn, l);
+    }
+    return g;
+}
+
+/* byte offset of the start of each line, rebuilt when the buffer changes */
+static void ts_offsets(Buf *b) {
+    if (!b->ts_off_dirty && b->ts_off) return;
+    b->ts_off = xrealloc(b->ts_off, (size_t)(b->n + 1) * sizeof *b->ts_off);
+    uint32_t o = 0;
+    for (int i = 0; i < b->n; i++) { b->ts_off[i] = o; o += (uint32_t)b->ln[i].len + 1; }
+    b->ts_off[b->n] = o;
+    b->ts_bytes = o;
+    b->ts_off_dirty = 0;
+}
+/* feed the line array to tree-sitter without flattening it into one string */
+static const char *ts_read(void *payload, uint32_t byte, TSPoint pt, uint32_t *len) {
+    (void)pt;
+    Buf *b = payload;
+    if (byte >= b->ts_bytes) { *len = 0; return ""; }
+    int lo = 0, hi = b->n - 1, li = 0;
+    while (lo <= hi) {                       /* which line holds `byte`? */
+        int mid = (lo + hi) / 2;
+        if (b->ts_off[mid] <= byte) { li = mid; lo = mid + 1; } else hi = mid - 1;
+    }
+    uint32_t within = byte - b->ts_off[li];
+    if (within < (uint32_t)b->ln[li].len) {
+        *len = (uint32_t)b->ln[li].len - within;
+        return b->ln[li].s + within;
+    }
+    *len = 1;                                 /* the line's newline */
+    return "\n";
+}
+static void ts_reparse(Buf *b) {
+    TSGram *g = ts_for(b->lang);
+    if (!g) return;
+    if (!b->ts_parser) {
+        b->ts_parser = ts_parser_new();
+        if (!ts_parser_set_language(b->ts_parser, g->lang)) {
+            ts_parser_delete(b->ts_parser);
+            b->ts_parser = NULL;
+            return;
+        }
+    }
+    if (b->ts_tree && b->ts_ver == b->ver) return;      /* still current */
+    ts_offsets(b);
+    TSInput in = { b, ts_read, TSInputEncodingUTF8, NULL };
+    /* ts_note_edit() has already applied every edit to the old tree, so this
+     * reparse is incremental: cost tracks the size of the change, not the file */
+    TSTree *t = ts_parser_parse(b->ts_parser, b->ts_tree, in);
+    if (!t) return;
+    if (b->ts_tree) ts_tree_delete(b->ts_tree);
+    b->ts_tree = t;
+    b->ts_ver = b->ver;
+}
+/* Collected captures for the visible window, shortest-span-last so that the
+ * most specific capture is the one that ends up painted. */
+typedef struct { uint32_t s, e; unsigned char a; } TSSpan;
+static TSSpan *tsspan = NULL;
+static int     ntsspan = 0, tsspan_cap = 0;
+static int     tsspan_buf_ver = -1;
+static Buf    *tsspan_buf = NULL;
+static int     tsspan_y0 = -1, tsspan_y1 = -1;
+
+/* a buffer is going away — make sure the span cache stops referring to it */
+static void ts_forget(Buf *b) {
+    if (tsspan_buf == b) { tsspan_buf = NULL; ntsspan = 0; tsspan_buf_ver = -1; }
+}
+static int tsspan_cmp(const void *x, const void *y) {
+    const TSSpan *a = x, *b = y;
+    uint32_t la = a->e - a->s, lb = b->e - b->s;
+    if (la != lb) return la < lb ? 1 : -1;      /* longest first */
+    return a->s < b->s ? -1 : a->s > b->s;
+}
+/* Run the highlight query over lines [y0,y1] only. */
+static void ts_collect(Buf *b, int y0, int y1) {
+    TSGram *g = ts_for(b->lang);
+    if (!g) return;
+    ts_reparse(b);
+    if (!b->ts_tree) return;
+    if (tsspan_buf == b && tsspan_buf_ver == b->ts_ver &&
+        tsspan_y0 == y0 && tsspan_y1 == y1) return;         /* cache hit */
+
+    ntsspan = 0;
+    tsspan_buf = b; tsspan_buf_ver = b->ts_ver;
+    tsspan_y0 = y0; tsspan_y1 = y1;
+
+    static TSQueryCursor *cur_q = NULL;
+    if (!cur_q) cur_q = ts_query_cursor_new();
+    ts_query_cursor_set_byte_range(cur_q, b->ts_off[y0], b->ts_off[y1 + 1]);
+    ts_query_cursor_exec(cur_q, g->query, ts_tree_root_node(b->ts_tree));
+
+    TSQueryMatch m;
+    while (ts_query_cursor_next_match(cur_q, &m)) {
+        for (uint16_t i = 0; i < m.capture_count; i++) {
+            unsigned char a = g->cap[m.captures[i].index];
+            if (a == HA_DEF) continue;
+            uint32_t s = ts_node_start_byte(m.captures[i].node);
+            uint32_t e = ts_node_end_byte(m.captures[i].node);
+            if (e <= s) continue;
+            if (ntsspan == tsspan_cap) {
+                tsspan_cap = tsspan_cap ? tsspan_cap * 2 : 256;
+                tsspan = xrealloc(tsspan, (size_t)tsspan_cap * sizeof *tsspan);
+            }
+            tsspan[ntsspan].s = s; tsspan[ntsspan].e = e; tsspan[ntsspan].a = a;
+            ntsspan++;
+        }
+    }
+    qsort(tsspan, (size_t)ntsspan, sizeof *tsspan, tsspan_cmp);
+}
+/* Paint line `li`'s attrs from the collected spans. Returns 0 if tree-sitter
+ * has nothing for this buffer and the caller should use the lexer. */
+static int ts_line_attrs(Buf *b, int li, unsigned char *attr) {
+    if (!b->ts_tree || !tsspan || tsspan_buf != b) return 0;
+    int len = b->ln[li].len;
+    memset(attr, HA_DEF, (size_t)len);
+    uint32_t ls = b->ts_off[li], le = ls + (uint32_t)len;
+    for (int i = 0; i < ntsspan; i++) {
+        if (tsspan[i].e <= ls || tsspan[i].s >= le) continue;
+        uint32_t a = tsspan[i].s > ls ? tsspan[i].s - ls : 0;
+        uint32_t z = tsspan[i].e < le ? tsspan[i].e - ls : (uint32_t)len;
+        for (uint32_t k = a; k < z; k++) attr[k] = tsspan[i].a;
+    }
+    return 1;
+}
+#endif /* SDS_TREESITTER */
+
+/* One line's syntax attributes, from tree-sitter when a grammar is installed
+ * for this language and from the built-in lexer otherwise. */
+static void hl_line(Buf *b, int li, unsigned char *attr) {
+#ifdef SDS_TREESITTER
+    if (ts_line_attrs(b, li, attr)) return;
+#endif
+    Line *l = &b->ln[li];
+    lex_line(b->lang, l->s, l->len, l->hst, attr);
+}
+
+/* ── color pairs ──────────────────────────────────────────────────── */
 enum { CP_TAB_ACT = 1, CP_TAB, CP_SEL, CP_DIR, CP_STATUS, CP_LINENO, CP_MUTED,
        CP_KW, CP_TYPE, CP_STR, CP_COM, CP_NUM, CP_PRE, CP_FIND, CP_ERR };
 enum { OV_SEL = 1, OV_FIND = 2, OV_BRK = 4 };
 
+/* ── themes ───────────────────────────────────────────────────────── */
+/* A theme is twelve role colors. Each carries an explicit basic-8 fallback so
+ * the built-in themes still look right on an 8-color terminal — "tux" in
+ * particular is defined to reproduce sds's original hardcoded palette exactly. */
+typedef struct { int rgb; short basic; } Col;
+
+typedef struct {
+    char name[32];
+    Col  accent, bg, fg, muted, bg_alt, error;   /* UI roles   */
+    Col  kw, type, str, com, num, pre;           /* syntax     */
+} Theme;
+
+/* Original sds palette. accent=yellow, dirs/types=cyan, comments=blue …
+ * The hex values are the xterm renderings of those basic colors, so truecolor
+ * terminals get the same look rather than a different one. */
+static const Theme theme_tux = {
+    "tux",
+    { 0xf5a623, COLOR_YELLOW  }, { 0x000000, COLOR_BLACK },
+    { 0xffffff, COLOR_WHITE   }, { 0x3465a4, COLOR_BLUE  },
+    { 0x1a1a1a, COLOR_BLACK   }, { 0xd23c3d, COLOR_RED   },
+    { 0xad7fa8, COLOR_MAGENTA }, { 0x34e2e2, COLOR_CYAN  },
+    { 0x8ae234, COLOR_GREEN   }, { 0x3465a4, COLOR_BLUE  },
+    { 0xef2929, COLOR_RED     }, { 0x34e2e2, COLOR_CYAN  },
+};
+
+/* Presets carried over from the Python-era themes.toml. Their syntax colors
+ * are derived from each palette rather than invented. */
+static const Theme theme_presets[] = {
+    { "monokai",
+      { 0xfd971f, COLOR_YELLOW  }, { 0x272822, COLOR_BLACK },
+      { 0xf8f8f2, COLOR_WHITE   }, { 0x75715e, COLOR_BLUE  },
+      { 0x3e3d32, COLOR_BLACK   }, { 0xf92672, COLOR_RED   },
+      { 0xf92672, COLOR_MAGENTA }, { 0x66d9ef, COLOR_CYAN  },
+      { 0xe6db74, COLOR_GREEN   }, { 0x75715e, COLOR_BLUE  },
+      { 0xae81ff, COLOR_RED     }, { 0xa6e22e, COLOR_CYAN  } },
+    { "dracula",
+      { 0xbd93f9, COLOR_YELLOW  }, { 0x282a36, COLOR_BLACK },
+      { 0xf8f8f2, COLOR_WHITE   }, { 0x6272a4, COLOR_BLUE  },
+      { 0x44475a, COLOR_BLACK   }, { 0xff5555, COLOR_RED   },
+      { 0xff79c6, COLOR_MAGENTA }, { 0x8be9fd, COLOR_CYAN  },
+      { 0xf1fa8c, COLOR_GREEN   }, { 0x6272a4, COLOR_BLUE  },
+      { 0xbd93f9, COLOR_RED     }, { 0x50fa7b, COLOR_CYAN  } },
+    { "nord",
+      { 0x88c0d0, COLOR_YELLOW  }, { 0x2e3440, COLOR_BLACK },
+      { 0xd8dee9, COLOR_WHITE   }, { 0x4c566a, COLOR_BLUE  },
+      { 0x3b4252, COLOR_BLACK   }, { 0xbf616a, COLOR_RED   },
+      { 0x81a1c1, COLOR_MAGENTA }, { 0x8fbcbb, COLOR_CYAN  },
+      { 0xa3be8c, COLOR_GREEN   }, { 0x616e88, COLOR_BLUE  },
+      { 0xb48ead, COLOR_RED     }, { 0x5e81ac, COLOR_CYAN  } },
+    { "gruvbox",
+      { 0xfe8019, COLOR_YELLOW  }, { 0x282828, COLOR_BLACK },
+      { 0xebdbb2, COLOR_WHITE   }, { 0x928374, COLOR_BLUE  },
+      { 0x3c3836, COLOR_BLACK   }, { 0xfb4934, COLOR_RED   },
+      { 0xfb4934, COLOR_MAGENTA }, { 0x8ec07c, COLOR_CYAN  },
+      { 0xb8bb26, COLOR_GREEN   }, { 0x928374, COLOR_BLUE  },
+      { 0xd3869b, COLOR_RED     }, { 0xfabd2f, COLOR_CYAN  } },
+};
+
+static Theme theme;                 /* the active theme */
+
+/* nearest xterm-256 index for an rgb triple: try the 6×6×6 cube and the
+ * 24-step grey ramp, keep whichever is closer */
+static int rgb_to_256(int rgb) {
+    int r = rgb >> 16 & 0xff, g = rgb >> 8 & 0xff, b = rgb & 0xff;
+    static const int lv[6] = { 0, 95, 135, 175, 215, 255 };
+    int ci[3], comp[3] = { r, g, b };
+    for (int k = 0; k < 3; k++) {
+        int best = 0, bd = 1 << 30;
+        for (int i = 0; i < 6; i++) {
+            int d = abs(lv[i] - comp[k]);
+            if (d < bd) { bd = d; best = i; }
+        }
+        ci[k] = best;
+    }
+    int cube = 16 + 36 * ci[0] + 6 * ci[1] + ci[2];
+    int cd = 0;
+    for (int k = 0; k < 3; k++) { int d = lv[ci[k]] - comp[k]; cd += d * d; }
+
+    int grey = (r * 299 + g * 587 + b * 114) / 1000;
+    int gi = (grey - 8) / 10;
+    if (gi < 0) gi = 0;
+    if (gi > 23) gi = 23;
+    int gv = 8 + gi * 10, gd = 0;
+    for (int k = 0; k < 3; k++) { int d = gv - comp[k]; gd += d * d; }
+
+    return gd < cd ? 232 + gi : cube;
+}
+/* map a theme color onto whatever this terminal can actually show */
+static int col_of(Col c) {
+    if (COLORS >= (1 << 24)) return c.rgb;      /* direct/truecolor terminfo */
+    if (COLORS >= 256)       return rgb_to_256(c.rgb);
+    return c.basic;
+}
+static void apply_theme(void) {
+    if (!has_colors()) return;
+    int bg = col_of(theme.bg), fg = col_of(theme.fg);
+    /* -1 keeps the terminal's own background, which is what sds did before and
+     * what makes transparent terminals look right */
+    int dfl = (theme.bg.rgb == 0x000000) ? -1 : bg;
+    init_pair(CP_TAB_ACT, bg,                  col_of(theme.accent));
+    init_pair(CP_TAB,     fg,                  col_of(theme.bg_alt));
+    init_pair(CP_SEL,     bg,                  col_of(theme.accent));
+    init_pair(CP_DIR,     col_of(theme.type),  dfl);
+    init_pair(CP_STATUS,  bg,                  fg);
+    init_pair(CP_LINENO,  col_of(theme.accent), dfl);
+    init_pair(CP_MUTED,   col_of(theme.muted), dfl);
+    init_pair(CP_KW,      col_of(theme.kw),    dfl);
+    init_pair(CP_TYPE,    col_of(theme.type),  dfl);
+    init_pair(CP_STR,     col_of(theme.str),   dfl);
+    init_pair(CP_COM,     col_of(theme.com),   dfl);
+    init_pair(CP_NUM,     col_of(theme.num),   dfl);
+    init_pair(CP_PRE,     col_of(theme.pre),   dfl);
+    init_pair(CP_FIND,    bg,                  col_of(theme.str));
+    init_pair(CP_ERR,     fg,                  col_of(theme.error));
+}
+
+/* ── keybindings ──────────────────────────────────────────────────── */
+enum { KB_QUIT, KB_SAVE, KB_CLOSE_TAB, KB_HELP, KB_RUN, KB_TERM, KB_FIND,
+       KB_FIND_NEXT, KB_REPLACE, KB_GOTO, KB_QUICKOPEN, KB_COMPLETE,
+       KB_NEW_ENTRY, KB_DEL_ENTRY, KB_REFRESH, KB_TREE_UP, KB_TREE_DOWN,
+       KB_TREE_COLLAPSE, KB_TREE_EXPAND, KB_TREE_OPEN, KB_TAB_PREV,
+       KB_TAB_NEXT, KB_WRAP, KB_SIDEBAR, KB_N };
+
+static const struct { const char *name; int dflt; } kb_def[] = {
+    { "quit",          ALT('q')          }, { "save",        CTRL('s')         },
+    { "close_tab",     ALT('w')          }, { "help",        ALT('h')          },
+    { "run",           ALT('r')          }, { "terminal",    ALT('t')          },
+    { "find",          CTRL('f')         }, { "find_next",   KEY_F(3)          },
+    { "replace",       CTRL('r')         }, { "goto",        CTRL('g')         },
+    { "quick_open",    CTRL('p')         }, { "complete",    0 /* Ctrl+Space */},
+    { "new_entry",     K_AINS            }, { "delete_entry", K_ADEL           },
+    { "refresh",       KEY_F(5)          }, { "tree_up",     MK(3, D_UP)       },
+    { "tree_down",     MK(3, D_DOWN)     }, { "tree_collapse", MK(3, D_LEFT)   },
+    { "tree_expand",   MK(3, D_RIGHT)    }, { "tree_open",   ALT('\n')         },
+    { "tab_prev",      ALT(',')          }, { "tab_next",    ALT('.')          },
+    { "wrap",          ALT('z')          }, { "sidebar",     ALT('b')          },
+};
+static int kb[KB_N];
+
+/* "ctrl+shift+left", "alt+q", "f5", "escape" … → an sds key code, or -1 */
+static int parse_key(const char *s) {
+    int alt = 0, ctrl = 0, shift = 0;
+    char buf[64];
+    snprintf(buf, sizeof buf, "%s", s);
+    for (char *p = buf; *p; p++) *p = (char)tolower((unsigned char)*p);
+
+    char *k = buf;
+    for (;;) {
+        char *plus = strchr(k, '+');
+        if (!plus) break;
+        *plus = 0;
+        if      (!strcmp(k, "ctrl") || !strcmp(k, "control")) ctrl = 1;
+        else if (!strcmp(k, "alt")  || !strcmp(k, "meta"))    alt = 1;
+        else if (!strcmp(k, "shift"))                         shift = 1;
+        else return -1;
+        k = plus + 1;
+    }
+    if (!*k) return -1;
+
+    /* arrows / home / end take the modifier-encoding path */
+    int dir = -1;
+    if      (!strcmp(k, "up"))    dir = D_UP;
+    else if (!strcmp(k, "down"))  dir = D_DOWN;
+    else if (!strcmp(k, "left"))  dir = D_LEFT;
+    else if (!strcmp(k, "right")) dir = D_RIGHT;
+    else if (!strcmp(k, "home"))  dir = D_HOME;
+    else if (!strcmp(k, "end"))   dir = D_END;
+    if (dir >= 0) {
+        int mod = 1 + shift + 2 * alt + 4 * ctrl;      /* xterm's scheme */
+        if (mod == 1) {
+            switch (dir) {
+                case D_UP:    return KEY_UP;
+                case D_DOWN:  return KEY_DOWN;
+                case D_LEFT:  return KEY_LEFT;
+                case D_RIGHT: return KEY_RIGHT;
+                case D_HOME:  return KEY_HOME;
+                default:      return KEY_END;
+            }
+        }
+        return MK(mod, dir);
+    }
+    if (k[0] == 'f' && isdigit((unsigned char)k[1])) {
+        int n = atoi(k + 1);
+        if (n >= 1 && n <= 12) return KEY_F(n);
+        return -1;
+    }
+    if (!strcmp(k, "insert")) return alt ? K_AINS : KEY_IC;
+    if (!strcmp(k, "delete")) return alt ? K_ADEL : KEY_DC;
+    if (!strcmp(k, "enter") || !strcmp(k, "return"))
+        return alt ? ALT('\n') : '\r';
+    if (!strcmp(k, "escape") || !strcmp(k, "esc")) return alt ? ALT(27) : 27;
+    if (!strcmp(k, "space"))  return ctrl ? 0 : (alt ? ALT(' ') : ' ');
+    if (!strcmp(k, "tab"))    return '\t';
+    if (!strcmp(k, "pageup"))   return KEY_PPAGE;
+    if (!strcmp(k, "pagedown")) return KEY_NPAGE;
+    if (k[1]) return -1;                          /* multi-char, unrecognised */
+    if (ctrl) return CTRL(k[0]);
+    if (alt)  return ALT(k[0]);
+    return (unsigned char)k[0];
+}
+
+/* ── config ───────────────────────────────────────────────────────── */
+static char cfg_dir[PATH_MAX];
+static char cfg_warn[256] = "";     /* shown once in the status bar at startup */
+
+static void cfg_dir_init(void) {
+    const char *xdg = getenv("XDG_CONFIG_HOME");
+    const char *home = getenv("HOME");
+    if (xdg && *xdg) snprintf(cfg_dir, sizeof cfg_dir, "%s/sds", xdg);
+    else if (home && *home) snprintf(cfg_dir, sizeof cfg_dir, "%s/.config/sds", home);
+    else cfg_dir[0] = 0;
+}
+/* strip a trailing comment and surrounding whitespace/quotes, in place */
+static char *cfg_clean(char *s) {
+    int inq = 0;
+    for (char *p = s; *p; p++) {
+        if (*p == '"') inq = !inq;
+        else if ((*p == '#' || *p == ';') && !inq) { *p = 0; break; }
+    }
+    while (*s == ' ' || *s == '\t') s++;
+    char *e = s + strlen(s);
+    while (e > s && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r' || e[-1] == '\n')) e--;
+    *e = 0;
+    if (e > s + 1 && *s == '"' && e[-1] == '"') { s++; e[-1] = 0; }
+    return s;
+}
+static int parse_hex(const char *s, int *out) {
+    if (*s == '#') s++;
+    if (strlen(s) != 6) return 0;
+    char *end;
+    long v = strtol(s, &end, 16);
+    if (*end) return 0;
+    *out = (int)v;
+    return 1;
+}
+/* assign one "key = value" into a theme; returns 1 if the key was a color */
+static int theme_set(Theme *t, const char *k, const char *v) {
+    static const char *names[] = { "accent", "bg", "fg", "muted", "bg_alt",
+                                   "error", "kw", "type", "str", "com",
+                                   "num", "pre" };
+    Col *slots[] = { &t->accent, &t->bg, &t->fg, &t->muted, &t->bg_alt,
+                     &t->error, &t->kw, &t->type, &t->str, &t->com,
+                     &t->num, &t->pre };
+    for (size_t i = 0; i < sizeof names / sizeof *names; i++)
+        if (!strcmp(k, names[i])) {
+            int rgb;
+            if (!parse_hex(v, &rgb)) return 1;      /* claimed, but unusable */
+            slots[i]->rgb = rgb;
+            /* a file-supplied color has no declared 8-color fallback; pick the
+             * nearest basic color so 8-color terminals still differentiate */
+            static const int b8[8] = { 0x000000, 0xcc0000, 0x4e9a06, 0xc4a000,
+                                       0x3465a4, 0x75507b, 0x06989a, 0xd3d7cf };
+            int best = 0, bd = 1 << 30;
+            for (int c = 0; c < 8; c++) {
+                int dr = (b8[c] >> 16 & 0xff) - (rgb >> 16 & 0xff);
+                int dg = (b8[c] >> 8  & 0xff) - (rgb >> 8  & 0xff);
+                int db = (b8[c]       & 0xff) - (rgb       & 0xff);
+                int d = dr * dr + dg * dg + db * db;
+                if (d < bd) { bd = d; best = c; }
+            }
+            slots[i]->basic = (short)best;
+            return 1;
+        }
+    return 0;
+}
+/* Scan a themes file for [want] and load it into `out`. Returns 1 if found. */
+static int themes_file_load(const char *path, const char *want, Theme *out) {
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    char line[512];
+    int in = 0, found = 0;
+    while (fgets(line, sizeof line, f)) {
+        char *s = cfg_clean(line);
+        if (!*s) continue;
+        if (*s == '[') {
+            char *e = strchr(s, ']');
+            if (!e) continue;
+            *e = 0;
+            in = !strcmp(s + 1, want);
+            if (in) { found = 1; snprintf(out->name, sizeof out->name, "%s", want); }
+            continue;
+        }
+        if (!in) continue;
+        char *eq = strchr(s, '=');
+        if (!eq) continue;
+        *eq = 0;
+        theme_set(out, cfg_clean(s), cfg_clean(eq + 1));
+    }
+    fclose(f);
+    return found;
+}
+
+static const char *DEFAULT_CONFIG =
+"# SimpleDevSuite configuration.\n"
+"#\n"
+"# Every key below is optional — anything you leave out (or delete) falls back\n"
+"# to the built-in default shown here. Unknown keys are ignored rather than\n"
+"# treated as errors. Nothing hot-reloads; restart sds after editing.\n"
+"\n"
+"# Color theme. \"tux\" is sds's original palette. Other built-ins: monokai,\n"
+"# dracula, nord, gruvbox. Any [name] table in the `themes` file next to this\n"
+"# one also works, and overrides a built-in of the same name.\n"
+"theme = \"tux\"\n"
+"\n"
+"[editor]\n"
+"tab_width = 4        # render width of a tab character (1-16)\n"
+"soft_wrap = false    # start with word wrap on (toggle at runtime with Alt+Z)\n"
+"\n"
+"[tree]\n"
+"width = 30           # sidebar width in columns\n"
+"# Below this terminal width the sidebar hides itself so the editor stays\n"
+"# usable. Collapsing past the top level (Alt+Left) also hides it; Alt+Right\n"
+"# or Alt+B brings it back. Set to 0 to never auto-hide.\n"
+"auto_hide_below = 80\n"
+"\n"
+"[keys]\n"
+"# Syntax: lowercase, \"+\"-joined, e.g. \"ctrl+s\", \"alt+shift+up\", \"f5\".\n"
+"# Only these app-level actions are remappable; in-editor chords are not.\n"
+"#\n"
+"# The tree keys default to Alt+<something>. If your window manager grabs Alt\n"
+"# (common on i3/sway/Hyprland), remap them to combos it doesn't intercept.\n"
+"quit          = \"alt+q\"\n"
+"save          = \"ctrl+s\"\n"
+"close_tab     = \"alt+w\"\n"
+"help          = \"alt+h\"\n"
+"run           = \"alt+r\"\n"
+"terminal      = \"alt+t\"\n"
+"find          = \"ctrl+f\"\n"
+"find_next     = \"f3\"\n"
+"replace       = \"ctrl+r\"\n"
+"goto          = \"ctrl+g\"\n"
+"quick_open    = \"ctrl+p\"\n"
+"complete      = \"ctrl+space\"\n"
+"new_entry     = \"alt+insert\"\n"
+"delete_entry  = \"alt+delete\"\n"
+"refresh       = \"f5\"\n"
+"tree_up       = \"alt+up\"\n"
+"tree_down     = \"alt+down\"\n"
+"tree_collapse = \"alt+left\"\n"
+"tree_expand   = \"alt+right\"\n"
+"tree_open     = \"alt+enter\"\n"
+"tab_prev      = \"alt+,\"\n"
+"tab_next      = \"alt+.\"\n"
+"wrap          = \"alt+z\"\n"
+"sidebar       = \"alt+b\"\n";
+
+static const char *DEFAULT_THEMES =
+"# SimpleDevSuite themes.\n"
+"#\n"
+"# Select one from your `config` with e.g. theme = \"monokai\". A [name] table\n"
+"# here overrides a built-in theme of the same name, so you can retune \"tux\"\n"
+"# without renaming it. Add your own by copying a block and changing the name.\n"
+"#\n"
+"# Twelve roles, all \"#rrggbb\". Missing ones inherit the built-in default.\n"
+"#   accent  active tab, tree selection, line numbers\n"
+"#   bg      primary background (and the text color on accent surfaces)\n"
+"#   fg      primary text\n"
+"#   muted   tree rules, dim text, the inactive UI\n"
+"#   bg_alt  tab bar background\n"
+"#   error   error dialogs and messages\n"
+"#   kw type str com num pre    syntax: keywords, types, strings,\n"
+"#                              comments, numbers, preprocessor\n"
+"\n"
+"[tux]\n"
+"accent = \"#f5a623\"\n"
+"bg     = \"#000000\"\n"
+"fg     = \"#ffffff\"\n"
+"muted  = \"#3465a4\"\n"
+"bg_alt = \"#1a1a1a\"\n"
+"error  = \"#d23c3d\"\n"
+"kw     = \"#ad7fa8\"\n"
+"type   = \"#34e2e2\"\n"
+"str    = \"#8ae234\"\n"
+"com    = \"#3465a4\"\n"
+"num    = \"#ef2929\"\n"
+"pre    = \"#34e2e2\"\n"
+"\n"
+"[monokai]\n"
+"accent = \"#fd971f\"\n"
+"bg     = \"#272822\"\n"
+"fg     = \"#f8f8f2\"\n"
+"muted  = \"#75715e\"\n"
+"bg_alt = \"#3e3d32\"\n"
+"error  = \"#f92672\"\n"
+"kw     = \"#f92672\"\n"
+"type   = \"#66d9ef\"\n"
+"str    = \"#e6db74\"\n"
+"com    = \"#75715e\"\n"
+"num    = \"#ae81ff\"\n"
+"pre    = \"#a6e22e\"\n"
+"\n"
+"[dracula]\n"
+"accent = \"#bd93f9\"\n"
+"bg     = \"#282a36\"\n"
+"fg     = \"#f8f8f2\"\n"
+"muted  = \"#6272a4\"\n"
+"bg_alt = \"#44475a\"\n"
+"error  = \"#ff5555\"\n"
+"kw     = \"#ff79c6\"\n"
+"type   = \"#8be9fd\"\n"
+"str    = \"#f1fa8c\"\n"
+"com    = \"#6272a4\"\n"
+"num    = \"#bd93f9\"\n"
+"pre    = \"#50fa7b\"\n"
+"\n"
+"[nord]\n"
+"accent = \"#88c0d0\"\n"
+"bg     = \"#2e3440\"\n"
+"fg     = \"#d8dee9\"\n"
+"muted  = \"#4c566a\"\n"
+"bg_alt = \"#3b4252\"\n"
+"error  = \"#bf616a\"\n"
+"kw     = \"#81a1c1\"\n"
+"type   = \"#8fbcbb\"\n"
+"str    = \"#a3be8c\"\n"
+"com    = \"#616e88\"\n"
+"num    = \"#b48ead\"\n"
+"pre    = \"#5e81ac\"\n"
+"\n"
+"[gruvbox]\n"
+"accent = \"#fe8019\"\n"
+"bg     = \"#282828\"\n"
+"fg     = \"#ebdbb2\"\n"
+"muted  = \"#928374\"\n"
+"bg_alt = \"#3c3836\"\n"
+"error  = \"#fb4934\"\n"
+"kw     = \"#fb4934\"\n"
+"type   = \"#8ec07c\"\n"
+"str    = \"#b8bb26\"\n"
+"com    = \"#928374\"\n"
+"num    = \"#d3869b\"\n"
+"pre    = \"#fabd2f\"\n";
+
+static int write_if_absent(const char *path, const char *body) {
+    if (access(path, F_OK) == 0) return 0;
+    FILE *f = fopen(path, "w");
+    if (!f) return 0;
+    fputs(body, f);
+    fclose(f);
+    return 1;
+}
+/* Create ~/.config/sds/{config,themes,syntax/} the first time sds runs.
+ * Best-effort: a read-only home just means the built-in defaults apply. */
+static int cfg_write_defaults(void) {
+    if (!cfg_dir[0]) return 0;
+    char p[PATH_MAX];
+    const char *home = getenv("HOME");
+    if (home && *home) {                        /* ensure ~/.config exists */
+        snprintf(p, sizeof p, "%s/.config", home);
+        mkdir(p, 0755);
+    }
+    if (mkdir(cfg_dir, 0755) != 0 && errno != EEXIST) return 0;
+    snprintf(p, sizeof p, "%s/syntax", cfg_dir);
+    mkdir(p, 0755);
+    int wrote = 0;
+    snprintf(p, sizeof p, "%s/config", cfg_dir);
+    wrote |= write_if_absent(p, DEFAULT_CONFIG);
+    snprintf(p, sizeof p, "%s/themes", cfg_dir);
+    wrote |= write_if_absent(p, DEFAULT_THEMES);
+    return wrote;
+}
+/* Read the config, resolve the theme, and fill kb[]. Never fails hard: a
+ * malformed file leaves the built-in defaults in place and sets cfg_warn. */
+static void cfg_load(void) {
+    char want[32] = "tux";
+    for (int i = 0; i < KB_N; i++) kb[i] = kb_def[i].dflt;
+
+    cfg_dir_init();
+    int fresh = cfg_write_defaults();
+
+    char path[PATH_MAX];
+    if (cfg_dir[0]) {
+        snprintf(path, sizeof path, "%s/config", cfg_dir);
+        FILE *f = fopen(path, "r");
+        if (f) {
+            char line[512];
+            char sect[32] = "";
+            int bad = 0;
+            while (fgets(line, sizeof line, f)) {
+                char *s = cfg_clean(line);
+                if (!*s) continue;
+                if (*s == '[') {
+                    char *e = strchr(s, ']');
+                    if (!e) { bad++; continue; }
+                    *e = 0;
+                    snprintf(sect, sizeof sect, "%s", s + 1);
+                    continue;
+                }
+                char *eq = strchr(s, '=');
+                if (!eq) { bad++; continue; }
+                *eq = 0;
+                char *k = cfg_clean(s), *v = cfg_clean(eq + 1);
+
+                if (!sect[0] && !strcmp(k, "theme")) {
+                    snprintf(want, sizeof want, "%s", v);
+                } else if (!strcmp(sect, "editor")) {
+                    if (!strcmp(k, "tab_width")) {
+                        int n = atoi(v);
+                        if (n >= 1 && n <= TABSTOP_MAX) tabstop = n;
+                    } else if (!strcmp(k, "soft_wrap")) {
+                        wrap = !strcmp(v, "true") || !strcmp(v, "1");
+                    }
+                } else if (!strcmp(sect, "tree")) {
+                    if (!strcmp(k, "width")) {
+                        int n = atoi(v);
+                        if (n >= 10 && n <= 100) tree_w = n;
+                    } else if (!strcmp(k, "auto_hide_below")) {
+                        tree_autohide = atoi(v);
+                    }
+                } else if (!strcmp(sect, "keys")) {
+                    for (int i = 0; i < KB_N; i++)
+                        if (!strcmp(k, kb_def[i].name)) {
+                            int c = parse_key(v);
+                            if (c >= 0) kb[i] = c;
+                            else bad++;
+                            break;
+                        }
+                }
+            }
+            fclose(f);
+            if (bad)
+                snprintf(cfg_warn, sizeof cfg_warn,
+                         "config: %d unusable line(s), using defaults there", bad);
+        }
+    }
+
+    /* built-in theme first, then let a themes file of the same name override */
+    theme = theme_tux;
+    for (size_t i = 0; i < sizeof theme_presets / sizeof *theme_presets; i++)
+        if (!strcmp(theme_presets[i].name, want)) { theme = theme_presets[i]; break; }
+    int known = !strcmp(theme.name, want);
+    if (cfg_dir[0]) {
+        snprintf(path, sizeof path, "%s/themes", cfg_dir);
+        if (themes_file_load(path, want, &theme)) known = 1;
+    }
+    if (!known && !cfg_warn[0])
+        snprintf(cfg_warn, sizeof cfg_warn, "unknown theme \"%s\" — using tux", want);
+    if (fresh && !cfg_warn[0])
+        snprintf(cfg_warn, sizeof cfg_warn, "wrote default config to %s", cfg_dir);
+}
+
+/* ── git status ───────────────────────────────────────────────────── */
+/* One `git status --porcelain` per refresh, cached in a flat sorted table
+ * that the tree draw looks up by path. Directories inherit the "contains
+ * something interesting" marker from their children. */
+typedef struct { char *path; char st; } GitEnt;
+
+static GitEnt *gitent = NULL;
+static int     ngit = 0, gitcap = 0;
+static int     git_repo = 0;
+static char    git_branch[128] = "";
+
+static int gitent_cmp(const void *a, const void *b) {
+    return strcmp(((const GitEnt *)a)->path, ((const GitEnt *)b)->path);
+}
+/* Wrap a path for the shell. A directory name may legitimately contain a
+ * quote, so close/escape/reopen rather than trusting the input. Returns 0 if
+ * the result would not fit, in which case the caller skips the command. */
+static int shq(char *out, size_t cap, const char *s) {
+    size_t n = 0;
+    if (cap < 3) return 0;
+    out[n++] = '\'';
+    for (; *s; s++) {
+        if (*s == '\'') {
+            if (n + 4 >= cap) return 0;
+            memcpy(out + n, "'\\''", 4);
+            n += 4;
+        } else {
+            if (n + 1 >= cap) return 0;
+            out[n++] = *s;
+        }
+    }
+    if (n + 2 > cap) return 0;
+    out[n++] = '\'';
+    out[n] = 0;
+    return 1;
+}
+static void git_clear(void) {
+    for (int i = 0; i < ngit; i++) free(gitent[i].path);
+    ngit = 0;
+    git_repo = 0;
+    git_branch[0] = 0;
+}
+static void git_add(const char *rel, char st) {
+    if (ngit == gitcap) {
+        gitcap = gitcap ? gitcap * 2 : 128;
+        gitent = xrealloc(gitent, (size_t)gitcap * sizeof *gitent);
+    }
+    gitent[ngit].path = xstrdup(rel);
+    gitent[ngit].st = st;
+    ngit++;
+}
+/* Reduce a two-column porcelain code to the single letter shown in the tree. */
+static char git_code(const char *xy) {
+    char x = xy[0], y = xy[1];
+    if (x == '?' || y == '?') return '?';
+    if (x == 'A' || y == 'A') return 'A';
+    if (x == 'D' || y == 'D') return 'D';
+    if (x == 'R' || y == 'R') return 'R';
+    if (x != ' ' && x != '?') return 'S';      /* staged */
+    return 'M';
+}
+static void git_refresh(void) {
+    git_clear();
+    if (!root) return;
+
+    char qroot[PATH_MAX * 2 + 8], cmd[PATH_MAX * 2 + 96];
+    if (!shq(qroot, sizeof qroot, root->path)) return;
+    snprintf(cmd, sizeof cmd,
+             "git -C %s rev-parse --abbrev-ref HEAD 2>/dev/null", qroot);
+    FILE *f = popen(cmd, "r");
+    if (f) {
+        if (fgets(git_branch, sizeof git_branch, f)) {
+            git_branch[strcspn(git_branch, "\r\n")] = 0;
+            if (git_branch[0]) git_repo = 1;
+        }
+        pclose(f);
+    }
+    if (!git_repo) return;
+
+    snprintf(cmd, sizeof cmd,
+             "git -C %s status --porcelain 2>/dev/null", qroot);
+    f = popen(cmd, "r");
+    if (!f) return;
+    char line[PATH_MAX + 8];
+    while (fgets(line, sizeof line, f)) {
+        line[strcspn(line, "\r\n")] = 0;
+        if (strlen(line) < 4) continue;
+        char st = git_code(line);
+        char *p = line + 3;
+        char *arrow = strstr(p, " -> ");      /* renames: take the new name */
+        if (arrow) p = arrow + 4;
+        size_t n = strlen(p);
+        if (n && p[n - 1] == '/') p[n - 1] = 0;   /* untracked dir */
+        if (*p == '"') {                          /* quoted path */
+            p++;
+            char *e = strrchr(p, '"');
+            if (e) *e = 0;
+        }
+        git_add(p, st);
+    }
+    pclose(f);
+    qsort(gitent, (size_t)ngit, sizeof *gitent, gitent_cmp);
+}
+/* Status letter for an absolute path, or 0. Directories report the status of
+ * whatever lies beneath them so a change is visible while collapsed. */
+static char git_status_for(const char *abs, int is_dir) {
+    if (!git_repo || !ngit || !root) return 0;
+    size_t rl = strlen(root->path);
+    if (strncmp(abs, root->path, rl) != 0) return 0;
+    const char *rel = abs + rl;
+    while (*rel == '/') rel++;
+    if (!*rel) return 0;
+
+    if (!is_dir) {
+        GitEnt key;
+        key.path = (char *)rel;
+        GitEnt *hit = bsearch(&key, gitent, (size_t)ngit, sizeof *gitent, gitent_cmp);
+        return hit ? hit->st : 0;
+    }
+    /* directory: any entry under "rel/" counts */
+    size_t n = strlen(rel);
+    for (int i = 0; i < ngit; i++)
+        if (strncmp(gitent[i].path, rel, n) == 0 && gitent[i].path[n] == '/')
+            return gitent[i].st == '?' ? '?' : 'M';
+    return 0;
+}
+
+/* ── terminal emulator ────────────────────────────────────────────── */
+/* A pty-backed shell living in a tab. The parser covers the subset of VT100 /
+ * xterm that interactive shells and full-screen programs actually rely on:
+ * cursor motion, erase, scroll regions, insert/delete, SGR colors, the
+ * alternate screen and OSC titles. Explicitly not handled: mouse reporting,
+ * sixel/graphics, double-width line attributes. */
+#define TERM_SB_MAX 1000       /* scrollback lines kept per terminal */
+
+typedef struct { char b[4]; unsigned char n, at; short fg, bg; } Cell;
+
+enum { TA_BOLD = 1, TA_UNDER = 2, TA_REV = 4, TA_DIM = 8 };
+enum { PS_GROUND, PS_ESC, PS_CSI, PS_OSC, PS_CHARSET };
+
+struct Term {
+    int    fd;
+    pid_t  pid;
+    int    rows, cols;
+    Cell  *g;                  /* rows*cols, the visible screen */
+    Cell  *alt;                /* alternate screen, allocated on first use */
+    int    alt_on;
+    int    cy, cx;
+    int    scy, scx;           /* saved cursor (ESC 7 / CSI s) */
+    unsigned char at; short fg, bg;
+    int    top, bot;           /* scroll region, inclusive */
+    int    wrapnext;           /* deferred wrap: cursor sits past the last col */
+    int    hidecur;
+    Cell  *sb;                 /* scrollback ring, TERM_SB_MAX rows of `cols` */
+    int    sb_n, sb_head, sb_view;
+    int    ps, np, params[8], priv, uexp;
+    char   osc[128]; int oscn;
+    int    dead, status;
+    char   title[64];
+    char   pend[4]; int pendn; /* partial UTF-8 arriving from the pty */
+};
+
+static Cell term_blank(Term *t) {
+    Cell c;
+    c.b[0] = ' '; c.b[1] = c.b[2] = c.b[3] = 0;
+    c.n = 1; c.at = 0; c.fg = -1; c.bg = t ? t->bg : -1;
+    return c;
+}
+static Cell *term_row(Term *t, int y) { return t->g + (size_t)y * t->cols; }
+static void term_clear_row(Term *t, int y, int from, int to) {
+    if (y < 0 || y >= t->rows) return;
+    Cell *r = term_row(t, y);
+    Cell b = term_blank(t);
+    for (int x = max2(0, from); x <= to && x < t->cols; x++) r[x] = b;
+}
+/* the line scrolling off the top of the region is kept for scrollback */
+static void term_to_scrollback(Term *t, int y) {
+    if (!t->sb || t->alt_on) return;
+    memcpy(t->sb + (size_t)t->sb_head * t->cols, term_row(t, y),
+           (size_t)t->cols * sizeof(Cell));
+    t->sb_head = (t->sb_head + 1) % TERM_SB_MAX;
+    if (t->sb_n < TERM_SB_MAX) t->sb_n++;
+}
+static void term_scroll_up(Term *t, int n) {
+    for (int k = 0; k < n; k++) {
+        term_to_scrollback(t, t->top);
+        for (int y = t->top; y < t->bot; y++)
+            memcpy(term_row(t, y), term_row(t, y + 1), (size_t)t->cols * sizeof(Cell));
+        term_clear_row(t, t->bot, 0, t->cols - 1);
+    }
+}
+static void term_scroll_down(Term *t, int n) {
+    for (int k = 0; k < n; k++) {
+        for (int y = t->bot; y > t->top; y--)
+            memcpy(term_row(t, y), term_row(t, y - 1), (size_t)t->cols * sizeof(Cell));
+        term_clear_row(t, t->top, 0, t->cols - 1);
+    }
+}
+static void term_newline(Term *t) {
+    if (t->cy == t->bot) term_scroll_up(t, 1);
+    else if (t->cy < t->rows - 1) t->cy++;
+}
+static void term_put(Term *t, const char *b, int n) {
+    if (t->wrapnext) { t->cx = 0; term_newline(t); t->wrapnext = 0; }
+    if (t->cx >= t->cols) t->cx = t->cols - 1;
+    Cell *c = &term_row(t, t->cy)[t->cx];
+    int k = n > 4 ? 4 : n;
+    memcpy(c->b, b, (size_t)k);
+    c->n = (unsigned char)k;
+    c->at = t->at; c->fg = t->fg; c->bg = t->bg;
+    if (t->cx + 1 >= t->cols) t->wrapnext = 1;      /* defer the wrap, like xterm */
+    else t->cx++;
+}
+static void term_sgr(Term *t) {
+    if (!t->np) { t->np = 1; t->params[0] = 0; }
+    for (int i = 0; i < t->np; i++) {
+        int p = t->params[i];
+        if (p == 0)      { t->at = 0; t->fg = -1; t->bg = -1; }
+        else if (p == 1) t->at |= TA_BOLD;
+        else if (p == 2) t->at |= TA_DIM;
+        else if (p == 4) t->at |= TA_UNDER;
+        else if (p == 7) t->at |= TA_REV;
+        else if (p == 22) t->at &= (unsigned char)~(TA_BOLD | TA_DIM);
+        else if (p == 24) t->at &= (unsigned char)~TA_UNDER;
+        else if (p == 27) t->at &= (unsigned char)~TA_REV;
+        else if (p >= 30 && p <= 37)   t->fg = (short)(p - 30);
+        else if (p >= 40 && p <= 47)   t->bg = (short)(p - 40);
+        else if (p >= 90 && p <= 97)   t->fg = (short)(p - 90 + 8);
+        else if (p >= 100 && p <= 107) t->bg = (short)(p - 100 + 8);
+        else if (p == 39) t->fg = -1;
+        else if (p == 49) t->bg = -1;
+        else if ((p == 38 || p == 48) && i + 1 < t->np) {
+            short v = -1;
+            if (t->params[i + 1] == 5 && i + 2 < t->np) {
+                v = (short)t->params[i + 2]; i += 2;
+            } else if (t->params[i + 1] == 2 && i + 4 < t->np) {
+                int rgb = (t->params[i+2] << 16) | (t->params[i+3] << 8) | t->params[i+4];
+                v = (short)rgb_to_256(rgb);        /* fold truecolor to 256 */
+                i += 4;
+            }
+            if (v >= 0) { if (p == 38) t->fg = v; else t->bg = v; }
+        }
+    }
+}
+static void term_use_alt(Term *t, int on) {
+    if (on == t->alt_on) return;
+    if (!t->alt) {
+        t->alt = xmalloc((size_t)t->rows * t->cols * sizeof(Cell));
+        Cell b = term_blank(t);
+        for (int i = 0; i < t->rows * t->cols; i++) t->alt[i] = b;
+    }
+    Cell *tmp = t->g; t->g = t->alt; t->alt = tmp;
+    t->alt_on = on;
+    if (on) {
+        Cell b = term_blank(t);
+        for (int i = 0; i < t->rows * t->cols; i++) t->g[i] = b;
+        t->cy = t->cx = 0;
+    }
+}
+static void term_csi(Term *t, char f) {
+    int p0 = t->np > 0 ? t->params[0] : 0;
+    int p1 = t->np > 1 ? t->params[1] : 0;
+    int n  = p0 ? p0 : 1;
+    switch (f) {
+        case 'A': t->cy = max2(t->top, t->cy - n); t->wrapnext = 0; break;
+        case 'B': t->cy = min2(t->bot, t->cy + n); t->wrapnext = 0; break;
+        case 'C': t->cx = min2(t->cols - 1, t->cx + n); t->wrapnext = 0; break;
+        case 'D': t->cx = max2(0, t->cx - n); t->wrapnext = 0; break;
+        case 'E': t->cy = min2(t->bot, t->cy + n); t->cx = 0; break;
+        case 'F': t->cy = max2(t->top, t->cy - n); t->cx = 0; break;
+        case 'G': t->cx = min2(t->cols - 1, max2(0, n - 1)); t->wrapnext = 0; break;
+        case 'd': t->cy = min2(t->rows - 1, max2(0, n - 1)); t->wrapnext = 0; break;
+        case 'H': case 'f':
+            t->cy = min2(t->rows - 1, max2(0, (p0 ? p0 : 1) - 1));
+            t->cx = min2(t->cols - 1, max2(0, (p1 ? p1 : 1) - 1));
+            t->wrapnext = 0;
+            break;
+        case 'J':
+            if (p0 == 0) {
+                term_clear_row(t, t->cy, t->cx, t->cols - 1);
+                for (int y = t->cy + 1; y < t->rows; y++) term_clear_row(t, y, 0, t->cols - 1);
+            } else if (p0 == 1) {
+                term_clear_row(t, t->cy, 0, t->cx);
+                for (int y = 0; y < t->cy; y++) term_clear_row(t, y, 0, t->cols - 1);
+            } else {
+                for (int y = 0; y < t->rows; y++) term_clear_row(t, y, 0, t->cols - 1);
+            }
+            break;
+        case 'K':
+            if (p0 == 0)      term_clear_row(t, t->cy, t->cx, t->cols - 1);
+            else if (p0 == 1) term_clear_row(t, t->cy, 0, t->cx);
+            else              term_clear_row(t, t->cy, 0, t->cols - 1);
+            break;
+        case 'L': { int s = t->top; t->top = t->cy;      /* insert lines */
+                    term_scroll_down(t, min2(n, t->bot - t->cy + 1)); t->top = s; break; }
+        case 'M': { int s = t->top; t->top = t->cy;      /* delete lines */
+                    term_scroll_up(t, min2(n, t->bot - t->cy + 1)); t->top = s; break; }
+        case 'P': {                                     /* delete chars */
+            Cell *r = term_row(t, t->cy);
+            int k = min2(n, t->cols - t->cx);
+            memmove(r + t->cx, r + t->cx + k,
+                    (size_t)(t->cols - t->cx - k) * sizeof(Cell));
+            term_clear_row(t, t->cy, t->cols - k, t->cols - 1);
+            break;
+        }
+        case '@': {                                     /* insert blanks */
+            Cell *r = term_row(t, t->cy);
+            int k = min2(n, t->cols - t->cx);
+            memmove(r + t->cx + k, r + t->cx,
+                    (size_t)(t->cols - t->cx - k) * sizeof(Cell));
+            term_clear_row(t, t->cy, t->cx, t->cx + k - 1);
+            break;
+        }
+        case 'X': term_clear_row(t, t->cy, t->cx, min2(t->cols - 1, t->cx + n - 1)); break;
+        case 'S': term_scroll_up(t, n);   break;
+        case 'T': term_scroll_down(t, n); break;
+        case 'r':
+            t->top = max2(0, (p0 ? p0 : 1) - 1);
+            t->bot = min2(t->rows - 1, (p1 ? p1 : t->rows) - 1);
+            if (t->top >= t->bot) { t->top = 0; t->bot = t->rows - 1; }
+            t->cy = t->top; t->cx = 0;
+            break;
+        case 'm': term_sgr(t); break;
+        case 's': t->scy = t->cy; t->scx = t->cx; break;
+        case 'u': t->cy = t->scy; t->cx = t->scx; break;
+        case 'h': case 'l':
+            if (t->priv) {
+                int on = (f == 'h');
+                if (p0 == 25) t->hidecur = !on;
+                else if (p0 == 1049 || p0 == 47 || p0 == 1047) term_use_alt(t, on);
+            }
+            break;
+        default: break;
+    }
+}
+/* run bytes from the pty through the parser */
+static void term_feed(Term *t, const char *s, int n) {
+    for (int i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        switch (t->ps) {
+            case PS_GROUND:
+                if (c == 0x1b) { t->ps = PS_ESC; t->np = 0; t->priv = 0; t->oscn = 0; }
+                else if (c == '\n' || c == 0x0b || c == 0x0c) { t->wrapnext = 0; term_newline(t); }
+                else if (c == '\r') { t->cx = 0; t->wrapnext = 0; }
+                else if (c == '\b') { if (t->cx > 0) t->cx--; t->wrapnext = 0; }
+                else if (c == '\t') {
+                    t->cx = min2(t->cols - 1, (t->cx / 8 + 1) * 8);
+                    t->wrapnext = 0;
+                }
+                else if (c < 32 || c == 127) { /* other C0: ignore */ }
+                else if (c < 0x80) { char b = (char)c; term_put(t, &b, 1); }
+                else {
+                    /* gather a UTF-8 sequence so it lands in one cell */
+                    if (t->pendn == 0) {
+                        t->uexp = (c >= 0xf0) ? 4 : (c >= 0xe0) ? 3 : 2;
+                        t->pend[0] = (char)c; t->pendn = 1;
+                    } else if (t->pendn < 4) {
+                        t->pend[t->pendn++] = (char)c;
+                    }
+                    if (t->pendn >= t->uexp) { term_put(t, t->pend, t->pendn); t->pendn = 0; }
+                }
+                break;
+            case PS_ESC:
+                if (c == '[') { t->ps = PS_CSI; t->np = 0; t->params[0] = 0; t->priv = 0; }
+                else if (c == ']') { t->ps = PS_OSC; t->oscn = 0; }
+                else if (c == '(' || c == ')' || c == '*' || c == '+') t->ps = PS_CHARSET;
+                else {
+                    if (c == 'M') {                     /* reverse index */
+                        if (t->cy == t->top) term_scroll_down(t, 1);
+                        else if (t->cy > 0) t->cy--;
+                    } else if (c == '7') { t->scy = t->cy; t->scx = t->cx; }
+                    else if (c == '8') { t->cy = t->scy; t->cx = t->scx; }
+                    else if (c == 'c') {                /* reset */
+                        t->at = 0; t->fg = t->bg = -1;
+                        t->top = 0; t->bot = t->rows - 1;
+                        for (int y = 0; y < t->rows; y++) term_clear_row(t, y, 0, t->cols - 1);
+                        t->cy = t->cx = 0;
+                    }
+                    t->ps = PS_GROUND;
+                }
+                break;
+            case PS_CHARSET: t->ps = PS_GROUND; break;
+            case PS_CSI:
+                if (c == '?' || c == '>' || c == '!' || c == '$' || c == '"' || c == '\'')
+                    t->priv = 1;
+                else if (isdigit(c)) {
+                    if (t->np == 0) t->np = 1;
+                    if (t->np <= 8) t->params[t->np - 1] = t->params[t->np - 1] * 10 + (c - '0');
+                } else if (c == ';' || c == ':') {
+                    if (t->np == 0) t->np = 1;
+                    if (t->np < 8) t->params[t->np++] = 0;
+                } else if (c >= 0x40 && c <= 0x7e) {
+                    term_csi(t, (char)c);
+                    t->ps = PS_GROUND;
+                }
+                break;
+            case PS_OSC:
+                if (c == 7 || c == 0x1b) {              /* BEL or start of ST */
+                    t->osc[t->oscn] = 0;
+                    if ((t->osc[0] == '0' || t->osc[0] == '2') && t->osc[1] == ';')
+                        snprintf(t->title, sizeof t->title, "%s", t->osc + 2);
+                    t->ps = PS_GROUND;
+                } else if (t->oscn + 1 < (int)sizeof t->osc) {
+                    t->osc[t->oscn++] = (char)c;
+                }
+                break;
+        }
+    }
+}
+
+/* ── terminal lifecycle ───────────────────────────────────────────── */
+static void term_size(Term *t, int rows, int cols) {
+    if (rows < 1) rows = 1;
+    if (cols < 1) cols = 1;
+    if (t->g && rows == t->rows && cols == t->cols) return;
+
+    Cell *ng = xmalloc((size_t)rows * cols * sizeof(Cell));
+    Cell blank = term_blank(t);
+    for (int i = 0; i < rows * cols; i++) ng[i] = blank;
+    if (t->g) {                             /* keep what still fits */
+        int keep = min2(rows, t->rows);
+        int srcy = t->rows - keep, dsty = rows - keep;
+        for (int y = 0; y < keep; y++)
+            memcpy(ng + (size_t)(dsty + y) * cols,
+                   t->g + (size_t)(srcy + y) * t->cols,
+                   (size_t)min2(cols, t->cols) * sizeof(Cell));
+        free(t->g);
+        t->cy = max2(0, min2(rows - 1, t->cy - srcy));
+    }
+    t->g = ng;
+    free(t->alt); t->alt = NULL;            /* rebuilt on next use */
+    t->alt_on = 0;
+
+    /* the scrollback ring is row-width-sensitive; simplest correct thing on a
+     * width change is to start it over rather than reflow */
+    if (!t->sb || cols != t->cols) {
+        free(t->sb);
+        t->sb = xmalloc((size_t)TERM_SB_MAX * cols * sizeof(Cell));
+        for (int i = 0; i < TERM_SB_MAX * cols; i++) t->sb[i] = blank;
+        t->sb_n = t->sb_head = t->sb_view = 0;
+    }
+    t->rows = rows; t->cols = cols;
+    t->top = 0; t->bot = rows - 1;
+    t->cx = min2(t->cx, cols - 1);
+    t->cy = min2(t->cy, rows - 1);
+    if (t->fd >= 0) {
+        struct winsize ws = { (unsigned short)rows, (unsigned short)cols, 0, 0 };
+        ioctl(t->fd, TIOCSWINSZ, &ws);
+    }
+}
+static Term *term_new(int rows, int cols, const char *cwd) {
+    Term *t = calloc(1, sizeof *t);
+    if (!t) die("out of memory");
+    t->fd = -1; t->fg = t->bg = -1;
+    t->rows = t->cols = 0;
+    snprintf(t->title, sizeof t->title, "shell");
+    term_size(t, rows, cols);
+
+    struct winsize ws = { (unsigned short)rows, (unsigned short)cols, 0, 0 };
+    pid_t pid = forkpty(&t->fd, NULL, NULL, &ws);
+    if (pid < 0) { free(t->g); free(t->sb); free(t); return NULL; }
+    if (pid == 0) {                          /* child: become the shell */
+        if (cwd) { if (chdir(cwd) != 0) { /* stay put */ } }
+        setenv("TERM", "xterm-256color", 1);
+        unsetenv("LINES"); unsetenv("COLUMNS");
+        const char *sh = getenv("SHELL");
+        if (!sh || !*sh) sh = "/bin/sh";
+        execl(sh, sh, "-i", (char *)NULL);
+        execl("/bin/sh", "sh", (char *)NULL);
+        _exit(127);
+    }
+    t->pid = pid;
+    fcntl(t->fd, F_SETFL, O_NONBLOCK);
+    return t;
+}
+static void term_free(Term *t) {
+    if (!t) return;
+    if (t->fd >= 0) close(t->fd);
+    if (t->pid > 0) {
+        kill(t->pid, SIGHUP);
+        waitpid(t->pid, NULL, WNOHANG);
+    }
+    free(t->g); free(t->alt); free(t->sb);
+    free(t);
+}
+/* Drain whatever the shell has produced. Returns 1 if the screen changed. */
+static int term_pump(Term *t) {
+    if (!t || t->fd < 0 || t->dead) return 0;
+    char buf[8192];
+    int changed = 0;
+    for (int guard = 0; guard < 64; guard++) {   /* bounded: stay responsive */
+        ssize_t n = read(t->fd, buf, sizeof buf);
+        if (n > 0) { term_feed(t, buf, (int)n); changed = 1; continue; }
+        if (n == 0) { t->dead = 1; changed = 1; break; }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+        if (errno == EINTR) continue;
+        t->dead = 1; changed = 1; break;         /* EIO: child exited */
+    }
+    if (t->dead && t->pid > 0) {
+        int st = 0;
+        if (waitpid(t->pid, &st, WNOHANG) == t->pid) { t->status = st; t->pid = 0; }
+    }
+    return changed;
+}
+static void term_write(Term *t, const char *s, int n) {
+    if (!t || t->fd < 0 || t->dead) return;
+    while (n > 0) {
+        ssize_t w = write(t->fd, s, (size_t)n);
+        if (w <= 0) { if (errno == EINTR) continue; break; }
+        s += w; n -= (int)w;
+    }
+}
+/* Translate an sds key code into the bytes a real terminal would send. */
+static void term_key(Term *t, int c) {
+    char b[16];
+    t->sb_view = 0;                       /* any keypress jumps back to live */
+    switch (c) {
+        case KEY_UP:    term_write(t, "\033[A", 3); return;
+        case KEY_DOWN:  term_write(t, "\033[B", 3); return;
+        case KEY_RIGHT: term_write(t, "\033[C", 3); return;
+        case KEY_LEFT:  term_write(t, "\033[D", 3); return;
+        case KEY_HOME:  term_write(t, "\033[H", 3); return;
+        case KEY_END:   term_write(t, "\033[F", 3); return;
+        case KEY_PPAGE: term_write(t, "\033[5~", 4); return;
+        case KEY_NPAGE: term_write(t, "\033[6~", 4); return;
+        case KEY_DC:    term_write(t, "\033[3~", 4); return;
+        case KEY_IC:    term_write(t, "\033[2~", 4); return;
+        case KEY_BTAB:  term_write(t, "\033[Z", 3); return;
+        case KEY_BACKSPACE: case 127: case 8: term_write(t, "\177", 1); return;
+        case '\r': case '\n': case KEY_ENTER: term_write(t, "\r", 1); return;
+        default: break;
+    }
+    if (c >= KEY_F(1) && c <= KEY_F(12)) {
+        static const char *fk[12] = {
+            "\033OP", "\033OQ", "\033OR", "\033OS", "\033[15~", "\033[17~",
+            "\033[18~", "\033[19~", "\033[20~", "\033[21~", "\033[23~", "\033[24~"
+        };
+        const char *s = fk[c - KEY_F(1)];
+        term_write(t, s, (int)strlen(s));
+        return;
+    }
+    if (c >= ALT(0) && c <= ALT(255)) {          /* Alt+x → ESC x */
+        b[0] = 27; b[1] = (char)(c - ALT(0));
+        term_write(t, b, 2);
+        return;
+    }
+    if (c >= 0 && c < 256) { b[0] = (char)c; term_write(t, b, 1); }
+}
+/* Open a shell in a new tab, sized to the current editor pane. */
+static void open_terminal(void) {
+    if (ntabs == MAX_TABS) { set_msg("too many open tabs", NULL); return; }
+    int x0 = tree_hidden ? 0 : tree_w + 1;
+    int rows = max2(1, LINES - 2), cols = max2(1, COLS - x0);
+    Term *t = term_new(rows, cols, root ? root->path : NULL);
+    if (!t) { set_msg("could not start a shell", NULL); return; }
+
+    Buf *b = calloc(1, sizeof *b);
+    if (!b) die("out of memory");
+    b->kind = TAB_TERM;
+    b->term = t;
+    b->lang = LANG_TEXT;
+    /* one empty line so any stray editor-side code still sees a sane buffer */
+    b->ln = xmalloc(sizeof(Line));
+    b->ln[0].s = xmalloc(1); b->ln[0].s[0] = 0;
+    b->ln[0].len = 0; b->ln[0].cap = 1; b->ln[0].hst = 0;
+    b->n = b->cap = 1;
+    snprintf(b->name, sizeof b->name, "shell");
+    snprintf(b->path, sizeof b->path, "%s", root ? root->path : "");
+    tabs[ntabs] = b;
+    cur = ntabs++;
+    set_msg("terminal opened — type 'exit' to close", NULL);
+}
+/* Any live terminal means the main loop must poll rather than block. */
+static int any_live_term(void) {
+    for (int i = 0; i < ntabs; i++)
+        if (tabs[i]->kind == TAB_TERM && tabs[i]->term && !tabs[i]->term->dead)
+            return 1;
+    return 0;
+}
+static int pump_all_terms(void) {
+    int changed = 0;
+    for (int i = 0; i < ntabs; i++)
+        if (tabs[i]->kind == TAB_TERM) changed |= term_pump(tabs[i]->term);
+    return changed;
+}
+
+/* ── rendering ────────────────────────────────────────────────────── */
+
 static int rx_of(Line *l, int cx) {
     int rx = 0;
     for (int i = 0; i < cx && i < l->len; i++)
-        rx = (l->s[i] == '\t') ? rx + TABSTOP - rx % TABSTOP : rx + 1;
+        rx = (l->s[i] == '\t') ? rx + tabstop - rx % tabstop : rx + 1;
     return rx;
 }
 static int cx_of_rx(Line *l, int rx) {       /* render col → byte index */
     int cur = 0;
     for (int i = 0; i < l->len; i++) {
-        cur = (l->s[i] == '\t') ? cur + TABSTOP - cur % TABSTOP : cur + 1;
+        cur = (l->s[i] == '\t') ? cur + tabstop - cur % tabstop : cur + 1;
         if (cur > rx) return i;
     }
     return l->len;
@@ -895,11 +2552,11 @@ static int draw_row(Buf *b, int scr_y, int scr_x, int li, int tw, int maxrows,
         cap = need * 2;
         hat = xrealloc(hat, (size_t)cap);
         ov  = xrealloc(ov,  (size_t)cap);
-        ech = xrealloc(ech, (size_t)cap * TABSTOP + 8);
-        eat = xrealloc(eat, (size_t)cap * TABSTOP + 8);
-        eov = xrealloc(eov, (size_t)cap * TABSTOP + 8);
+        ech = xrealloc(ech, (size_t)cap * TABSTOP_MAX + 8);
+        eat = xrealloc(eat, (size_t)cap * TABSTOP_MAX + 8);
+        eov = xrealloc(eov, (size_t)cap * TABSTOP_MAX + 8);
     }
-    lex_line(b->lang, l->s, l->len, l->hst, hat);
+    hl_line(b, li, hat);
     memset(ov, 0, (size_t)(l->len ? l->len : 1));
 
     int y1, x1, y2, x2;                                  /* selection */
@@ -923,7 +2580,7 @@ static int draw_row(Buf *b, int scr_y, int scr_x, int li, int tw, int maxrows,
     for (int i = 0; i < l->len; i++) {
         if (l->s[i] == '\t') {
             do { ech[n] = ' '; eat[n] = hat[i]; eov[n] = ov[i]; n++; }
-            while (n % TABSTOP);
+            while (n % tabstop);
         } else { ech[n] = l->s[i]; eat[n] = hat[i]; eov[n] = ov[i]; n++; }
     }
     if (!wrap) {
@@ -976,7 +2633,15 @@ static void draw_tabbar(int w) {
     int x = 0;
     for (int i = first; i < ntabs && x < w; i++) {
         char t[NAME_MAX + 8];
-        snprintf(t, sizeof t, " %s%s ", tabs[i]->name, tabs[i]->dirty ? "*" : "");
+        if (tabs[i]->kind == TAB_TERM) {
+            Term *tm = tabs[i]->term;
+            snprintf(t, sizeof t, " >_ %s%s ",
+                     tm && tm->title[0] ? tm->title : "shell",
+                     tm && tm->dead ? " (exited)" : "");
+        } else {
+            snprintf(t, sizeof t, " %s%s ", tabs[i]->name,
+                     tabs[i]->dirty ? "*" : "");
+        }
         int pair = (i == cur) ? CP_TAB_ACT : CP_TAB;
         attron(COLOR_PAIR(pair));
         if (i == cur) attron(A_BOLD);
@@ -996,6 +2661,7 @@ static void draw_tabbar(int w) {
     }
 }
 static void draw_tree(int h) {
+    if (tree_hidden) return;
     int rows = h - 2;
     if (tsel < toff) toff = tsel;
     if (tsel >= toff + rows) toff = tsel - rows + 1;
@@ -1004,7 +2670,7 @@ static void draw_tree(int h) {
         move(1 + r, 0);
         clrtoeol();
         attron(COLOR_PAIR(CP_MUTED));
-        mvaddch(1 + r, TREE_W, ACS_VLINE);
+        mvaddch(1 + r, tree_w, ACS_VLINE);
         attroff(COLOR_PAIR(CP_MUTED));
         if (i >= nvis) continue;
         Node *n = vis[i];
@@ -1013,13 +2679,22 @@ static void draw_tree(int h) {
         snprintf(line, sizeof line, "%*s%s%s", n->depth * 2, "", mark, n->name);
         if (i == tsel) attron(COLOR_PAIR(CP_SEL) | A_BOLD);
         else if (n->is_dir) attron(COLOR_PAIR(CP_DIR));
-        mvaddnstr(1 + r, 1, line, TREE_W - 2);
+        mvaddnstr(1 + r, 1, line, tree_w - 2);
         if (i == tsel) {
             int len = (int)strlen(line);
-            for (int x = 1 + len; x < TREE_W - 1; x++) mvaddch(1 + r, x, ' ');
+            for (int x = 1 + len; x < tree_w - 1; x++) mvaddch(1 + r, x, ' ');
         }
         if (i == tsel) attroff(COLOR_PAIR(CP_SEL) | A_BOLD);
         else if (n->is_dir) attroff(COLOR_PAIR(CP_DIR));
+        /* git marker in the last column, so it survives long names */
+        char gs = git_status_for(n->path, n->is_dir);
+        if (gs && tree_w >= 4) {
+            int pair = (gs == '?') ? CP_MUTED : (gs == 'D') ? CP_ERR : CP_LINENO;
+            if (i == tsel) pair = CP_SEL;
+            attron(COLOR_PAIR(pair) | A_BOLD);
+            mvaddch(1 + r, tree_w - 1, (chtype)gs);
+            attroff(COLOR_PAIR(pair) | A_BOLD);
+        }
     }
 }
 /* bracket matching for the highlight */
@@ -1052,8 +2727,73 @@ static void find_bracket(Buf *b) {
         }
     }
 }
+/* ncurses wants a pair number, the terminal gives us (fg,bg) pairs on demand.
+ * Allocate them lazily from a small cache above the app's fixed pairs. */
+#define CP_TERM_BASE 20
+static short term_pair(short fg, short bg) {
+    static struct { short fg, bg; } cache[160];
+    static int ncache = 0;
+    if (fg < 0 && bg < 0) return 0;
+    if (fg >= COLORS) fg = (short)(COLORS - 1);
+    if (bg >= COLORS) bg = (short)(COLORS - 1);
+    for (int i = 0; i < ncache; i++)
+        if (cache[i].fg == fg && cache[i].bg == bg)
+            return (short)(CP_TERM_BASE + i);
+    if (ncache >= (int)(sizeof cache / sizeof *cache) ||
+        CP_TERM_BASE + ncache >= COLOR_PAIRS) return 0;
+    cache[ncache].fg = fg; cache[ncache].bg = bg;
+    init_pair((short)(CP_TERM_BASE + ncache), fg, bg);
+    ncache++;
+    return (short)(CP_TERM_BASE + ncache - 1);
+}
+/* Draw one terminal tab. Rows above the live screen come from scrollback when
+ * the user has scrolled back with Shift+PgUp. */
+static void draw_term(Buf *b, int ytop, int x0, int rows, int cols) {
+    Term *t = b->term;
+    if (!t) return;
+    if (t->rows != rows || t->cols != cols) term_size(t, rows, cols);
+    if (t->sb_view > t->sb_n) t->sb_view = t->sb_n;
+
+    for (int r = 0; r < rows; r++) {
+        Cell *row;
+        if (r < t->sb_view) {
+            int li = t->sb_n - t->sb_view + r;             /* oldest = 0 */
+            int pos = (t->sb_head - t->sb_n + li + 2 * TERM_SB_MAX) % TERM_SB_MAX;
+            row = t->sb + (size_t)pos * t->cols;
+        } else {
+            int gy = r - t->sb_view;
+            if (gy >= t->rows) break;
+            row = term_row(t, gy);
+        }
+        move(ytop + r, x0);
+        for (int x = 0; x < cols && x0 + x < COLS; x++) {
+            Cell *c = &row[x];
+            attr_t a = COLOR_PAIR(term_pair(c->fg, c->bg));
+            if (c->at & TA_BOLD)  a |= A_BOLD;
+            if (c->at & TA_DIM)   a |= A_DIM;
+            if (c->at & TA_UNDER) a |= A_UNDERLINE;
+            if (c->at & TA_REV)   a |= A_REVERSE;
+            attrset(a);
+            mvaddnstr(ytop + r, x0 + x, c->b, c->n ? c->n : 1);
+        }
+    }
+    attrset(A_NORMAL);
+    if (t->dead) {
+        const char *m = " [process exited — Alt+W to close this tab] ";
+        attron(COLOR_PAIR(CP_ERR) | A_BOLD);
+        mvaddnstr(ytop + min2(t->cy + 1, rows - 1), x0, m, cols);
+        attroff(COLOR_PAIR(CP_ERR) | A_BOLD);
+    }
+    if (!t->hidecur && !t->dead && t->sb_view == 0)
+        move(ytop + min2(t->cy, rows - 1), x0 + min2(t->cx, cols - 1));
+}
+
 static void draw_editor(int h, int w) {
-    int x0 = TREE_W + 1, rows = h - 2, ew = w - x0;
+    int x0 = tree_hidden ? 0 : tree_w + 1, rows = h - 2, ew = w - x0;
+    if (cur >= 0 && tabs[cur]->kind == TAB_TERM) {
+        draw_term(tabs[cur], 1, x0, rows, ew);
+        return;
+    }
     if (cur < 0) {
         const char *hint[] = {
             "Alt+Up/Down   browse the file tree",
@@ -1108,6 +2848,10 @@ static void draw_editor(int h, int w) {
 
     find_bracket(b);
     ensure_hl(b, min2(b->rowoff + rows, b->n - 1));
+#ifdef SDS_TREESITTER
+    /* query only the window about to be drawn, not the whole file */
+    ts_collect(b, b->rowoff, min2(b->rowoff + rows, b->n - 1));
+#endif
 
     int r = 0;
     for (int i = b->rowoff; i < b->n && r < rows; i++) {
@@ -1138,12 +2882,28 @@ static void draw_status(int h, int w) {
     move(h - 1, 0);
     for (int i = 0; i < w; i++) addch(' ');
     char left[PATH_MAX + 64];
-    if (cur >= 0) {
+    if (cur >= 0 && tabs[cur]->kind == TAB_TERM) {
+        Term *t = tabs[cur]->term;
+        if (t && t->sb_view > 0)
+            snprintf(left, sizeof left, " terminal   scrollback -%d/%d"
+                     "   (any key returns to live)", t->sb_view, t->sb_n);
+        else if (t && t->dead)
+            snprintf(left, sizeof left, " terminal   exited (%d)",
+                     WIFEXITED(t->status) ? WEXITSTATUS(t->status) : -1);
+        else
+            snprintf(left, sizeof left, " terminal   %s   Shift+PgUp scrollback",
+                     t && t->title[0] ? t->title : "shell");
+    } else if (cur >= 0) {
         Buf *b = tabs[cur];
-        snprintf(left, sizeof left, " %s%s   %s%s   %d:%d",
+        char br[160] = "";
+        if (git_repo) snprintf(br, sizeof br, "   %s", git_branch);
+        snprintf(left, sizeof left, " %s%s   %s%s%s   %d:%d",
                  b->path, b->dirty ? " [+]" : "", b->lang->name,
-                 wrap ? "  wrap" : "", b->cy + 1, b->cx + 1);
-    } else snprintf(left, sizeof left, " %s", root->path);
+                 wrap ? "  wrap" : "", br, b->cy + 1, b->cx + 1);
+    } else {
+        if (git_repo) snprintf(left, sizeof left, " %s   %s", root->path, git_branch);
+        else          snprintf(left, sizeof left, " %s", root->path);
+    }
     mvaddnstr(h - 1, 0, left, w);
     if (msg[0]) {
         attron(A_BOLD);
@@ -1166,22 +2926,27 @@ static void draw_help(int h, int w) {
       "  Alt+Insert     new file/folder   Ctrl+D            duplicate line",
       "  Alt+Delete     delete file/dir   Ctrl+K            delete line   ",
       "  F5 / Alt+E     rescan tree       Ctrl+/            toggle comment",
-      "  TABS                                                             ",
-      "  Alt+, / Alt+.  prev / next tab                                   ",
-      "  Alt+1..9       go to tab N       Alt+Shift+Up/Dn   move line     ",
-      "  Alt+W          close tab         Alt+O             open line belo",
-      "                                   Tab / Shift+Tab   indent/dedent ",
-      "  FIND & GO                        Shift+arrows      select        ",
-      "  Ctrl+F  find (Enter=next)        Ctrl+Left/Right   word jump     ",
-      "  F3      find next                Ctrl+Home/End     file start/end",
-      "  Ctrl+R  replace (y/n/a/q)        Ctrl+Space        autocomplete  ",
-      "  Ctrl+G  go to line               Alt+Z             toggle wrap   ",
-      "  Ctrl+P  quick-open file          APP                             ",
-      "                                   Ctrl+S / Alt+S    save          ",
-      "  Esc  clear selection/highlight   Alt+R             run command   ",
-      "                                   Alt+Q             quit          ",
+      "  Alt+B          show/hide sidebar Alt+Shift+Up/Dn   move line     ",
+      "  (Alt+Left at the top level       Alt+O             open line belo",
+      "   also hides the sidebar)         Tab / Shift+Tab   indent/dedent ",
+      "  TABS                             Shift+arrows      select        ",
+      "  Alt+, / Alt+.  prev / next tab   Ctrl+Left/Right   word jump     ",
+      "  Alt+1..9       go to tab N       Ctrl+Home/End     file start/end",
+      "  Alt+W          close tab         Ctrl+Space        autocomplete  ",
+      "                                   Alt+Z             toggle wrap   ",
+      "  FIND & GO                                                        ",
+      "  Ctrl+F  find (Enter=next)        TERMINAL                        ",
+      "  F3      find next                Alt+T    new terminal tab       ",
+      "  Ctrl+R  replace (y/n/a/q)        Shift+PgUp/PgDn   scrollback    ",
+      "  Ctrl+G  go to line               type 'exit' to end the shell    ",
+      "  Ctrl+P  quick-open file                                          ",
+      "                                   APP                             ",
+      "  Esc  clear selection/highlight   Ctrl+S / Alt+S    save          ",
+      "                                   Alt+R             run command   ",
+      "  Tree marks: M modified  ? new    Alt+H             this help     ",
+      "              A added    D deleted Alt+Q             quit          ",
       "                                                                   ",
-      "  any key to close this                                            ",
+      "  config: ~/.config/sds/config     any key to close this           ",
     };
     int n = (int)(sizeof lines / sizeof *lines);
     int bw = (int)strlen(lines[0]) + 2, bh = n + 2;
@@ -1213,10 +2978,15 @@ static void draw(void) {
 static int read_key(void);
 /* Modal yes/no. `danger` paints the box red-ish and defaults to No.
  * y / n / Enter / arrows / Tab / Esc all behave as you'd expect.        */
+/* Popups paint the app behind them exactly once and then only repaint their
+ * own rectangle per keystroke. Calling draw() in the input loop was visibly
+ * slow on large files — it re-lexes and re-renders every on-screen line for
+ * each character typed — and that is what made the whole screen appear to
+ * flicker while typing into a dialog. */
 static int confirm(const char *title, const char *detail, int danger) {
     int yes = !danger;                       /* destructive → default No */
+    draw();
     for (;;) {
-        draw();
         int tl = (int)strlen(title), dl = detail ? (int)strlen(detail) : 0;
         int bw = max2(max2(tl, dl) + 6, 34);
         bw = min2(bw, COLS - 2);
@@ -1257,6 +3027,7 @@ static int confirm(const char *title, const char *detail, int danger) {
             case KEY_RIGHT: case MK(3, D_RIGHT):    yes = 1; break;
             case '\t':                              yes = !yes; break;
             case '\r': case '\n': case KEY_ENTER:   return yes;
+            case KEY_RESIZE:  draw();               break;  /* geometry moved */
         }
     }
 }
@@ -1265,8 +3036,8 @@ static int confirm(const char *title, const char *detail, int danger) {
 /* Centered single-line editor. Returns 1 on Enter, 0 on Esc. */
 static int input_box(const char *title, const char *hint, char *out, size_t cap) {
     size_t n = strlen(out);
+    draw();                       /* the app behind the dialog, once */
     for (;;) {
-        draw();
         int bw = min2(max2((int)strlen(title) + 6, 46), COLS - 2);
         int bh = hint ? 6 : 5;
         int y0 = max2(0, (LINES - bh) / 2), x0 = max2(0, (COLS - bw) / 2);
@@ -1295,6 +3066,7 @@ static int input_box(const char *title, const char *hint, char *out, size_t cap)
         int c = read_key();
         if (c == 27) return 0;
         if (c == '\r' || c == '\n' || c == KEY_ENTER) return n > 0;
+        if (c == KEY_RESIZE) { draw(); continue; }
         if (c == KEY_BACKSPACE || c == 127 || c == 8) { if (n) out[--n] = 0; }
         else if (c >= 32 && c < 256 && c != 127 && n + 1 < cap) {
             out[n++] = (char)c;
@@ -1433,6 +3205,7 @@ static void node_unlink(Node *n) {               /* detach from parent */
 static void close_tabs_under(const char *path, int is_dir) {
     size_t pl = strlen(path);
     for (int i = ntabs - 1; i >= 0; i--) {
+        if (tabs[i]->kind != TAB_FILE) continue;     /* terminals have no file */
         const char *tp = tabs[i]->path;
         int hit = is_dir ? (strncmp(tp, path, pl) == 0 && tp[pl] == '/')
                          : (strcmp(tp, path) == 0);
@@ -1518,7 +3291,12 @@ static int csi_tail(int defmod) {
         default:      return KEY_END;
     }
 }
-static int read_key(void) {
+/* How getch() should wait: -1 blocks, otherwise milliseconds. The main loop
+ * switches to a short poll while a terminal tab is running; dialogs always
+ * block, so they go through read_key() rather than read_key_raw(). */
+static int g_timeout = -1;
+
+static int read_key_raw(void) {
     int c = getch();
     if (c == KEY_SLEFT)  return MK(2, D_LEFT);
     if (c == KEY_SRIGHT) return MK(2, D_RIGHT);
@@ -1541,8 +3319,18 @@ static int read_key(void) {
     else if (c2 == '[' || c2 == 'O') r = csi_tail(0);   /* undecoded plain key */
     else if (c2 == '\r' || c2 == '\n' || c2 == KEY_ENTER) r = ALT('\n');
     else r = ALT(tolower(c2));
-    nodelay(stdscr, FALSE);
+    timeout(g_timeout);            /* not nodelay(FALSE): that forces blocking */
     return r;
+}
+/* Blocking read, for dialogs and anything that owns the screen. */
+static int read_key(void) {
+    int save = g_timeout;
+    g_timeout = -1;
+    timeout(-1);
+    int c = read_key_raw();
+    g_timeout = save;
+    timeout(save);
+    return c;
 }
 
 /* ── clipboard ────────────────────────────────────────────────────── */
@@ -1574,6 +3362,22 @@ static void clip_set(char *t, int len) {       /* takes ownership */
 }
 
 /* ── movement ─────────────────────────────────────────────────────── */
+/* Editing is byte-based, but the cursor must not land inside a multi-byte
+ * character or a single arrow press would split it and the next edit would
+ * corrupt the text. Continuation bytes are 10xxxxxx. */
+static int utf8_cont(unsigned char c) { return (c & 0xc0) == 0x80; }
+static int utf8_prev(Line *l, int cx) {
+    if (cx <= 0) return 0;
+    cx--;
+    while (cx > 0 && utf8_cont((unsigned char)l->s[cx])) cx--;
+    return cx;
+}
+static int utf8_next(Line *l, int cx) {
+    if (cx >= l->len) return l->len;
+    cx++;
+    while (cx < l->len && utf8_cont((unsigned char)l->s[cx])) cx++;
+    return cx;
+}
 enum { M_UP, M_DOWN, M_LEFT, M_RIGHT, M_HOME, M_END, M_PGUP, M_PGDN,
        M_WORDL, M_WORDR, M_DOCHOME, M_DOCEND };
 static void word_left(Buf *b) {
@@ -1626,11 +3430,11 @@ static void move_cursor(Buf *b, int kind, int shift) {
         case M_UP:    if (b->cy > 0) b->cy--; break;
         case M_DOWN:  if (b->cy < b->n - 1) b->cy++; break;
         case M_LEFT:
-            if (b->cx > 0) b->cx--;
+            if (b->cx > 0) b->cx = utf8_prev(l, b->cx);
             else if (b->cy > 0) { b->cy--; b->cx = b->ln[b->cy].len; }
             break;
         case M_RIGHT:
-            if (b->cx < l->len) b->cx++;
+            if (b->cx < l->len) b->cx = utf8_next(l, b->cx);
             else if (b->cy < b->n - 1) { b->cy++; b->cx = 0; }
             break;
         case M_HOME: {                        /* smart home */
@@ -1670,11 +3474,11 @@ static void ed_type(Buf *b, int c) {
         b->cx++;
         return;
     }
-    /* dedent a lone '}' — eat one tab or up to TABSTOP spaces */
+    /* dedent a lone '}' — eat one tab or up to tabstop spaces */
     if (c == '}' && line_indent_len(l) == b->cx && b->cx > 0) {
         int cut = 0;
         if (l->s[b->cx - 1] == '\t') cut = 1;
-        else while (cut < TABSTOP && cut < b->cx && l->s[b->cx - 1 - cut] == ' ')
+        else while (cut < tabstop && cut < b->cx && l->s[b->cx - 1 - cut] == ' ')
             cut++;
         if (cut) edit_del(b, b->cy, b->cx - cut, b->cy, b->cx);
     }
@@ -1738,7 +3542,7 @@ static void ed_backspace(Buf *b) {
                 return;
             }
         }
-        edit_del(b, b->cy, b->cx - 1, b->cy, b->cx);
+        edit_del(b, b->cy, utf8_prev(l, b->cx), b->cy, b->cx);
     } else if (b->cy > 0) {
         edit_del(b, b->cy - 1, b->ln[b->cy - 1].len, b->cy, 0);
     }
@@ -1747,7 +3551,7 @@ static void ed_delete(Buf *b) {
     if (b->sel) { begin_action(AK_OTHER); sel_delete(b); return; }
     begin_action(AK_OTHER);
     Line *l = &b->ln[b->cy];
-    if (b->cx < l->len) edit_del(b, b->cy, b->cx, b->cy, b->cx + 1);
+    if (b->cx < l->len) edit_del(b, b->cy, b->cx, b->cy, utf8_next(l, b->cx));
     else if (b->cy < b->n - 1) edit_del(b, b->cy, b->cx, b->cy + 1, 0);
 }
 static void ed_tab(Buf *b, int dedent) {
@@ -1779,7 +3583,7 @@ static void ed_tab(Buf *b, int dedent) {
     }
     if (b->lang->soft_tabs) {
         int col = rx_of(&b->ln[b->cy], b->cx);
-        int k = TABSTOP - col % TABSTOP;
+        int k = tabstop - col % tabstop;
         edit_ins(b, b->cy, b->cx, "        ", k);
     } else edit_ins(b, b->cy, b->cx, "\t", 1);
 }
@@ -1962,8 +3766,10 @@ static int prompt(const char *label, char *out, size_t cap,
     size_t n = strlen(out);
     int hidx = nrhist;
     char draft[512] = "";
+    draw();                       /* the app behind the prompt, once */
     for (;;) {
-        draw();
+        /* only the prompt line is repainted per keystroke; the editor behind
+         * it is redrawn solely when a live callback changes its highlighting */
         attron(COLOR_PAIR(CP_STATUS) | A_BOLD);
         move(LINES - 1, 0);
         for (int i = 0; i < COLS; i++) addch(' ');
@@ -1974,6 +3780,7 @@ static int prompt(const char *label, char *out, size_t cap,
         int c = read_key();
         if (c == 27) return 0;
         if (c == '\r' || c == '\n' || c == KEY_ENTER) return 1;
+        if (c == KEY_RESIZE) { draw(); continue; }
         if (use_hist && (c == KEY_UP || c == KEY_DOWN)) {
             if (c == KEY_UP && hidx > 0) {
                 if (hidx == nrhist) snprintf(draft, sizeof draft, "%s", out);
@@ -1991,7 +3798,7 @@ static int prompt(const char *label, char *out, size_t cap,
             out[n++] = (char)c;
             out[n] = 0;
         } else continue;
-        if (live) live(out);
+        if (live) { live(out); draw(); }
     }
 }
 
@@ -2144,6 +3951,7 @@ static void do_quickopen(void) {
     int seln = 0;
     int *idx = xmalloc((size_t)max2(nqo, 1) * sizeof(int));
     int *scr = xmalloc((size_t)max2(nqo, 1) * sizeof(int));
+    draw();                       /* the app behind the picker, once */
     for (;;) {
         int nm = 0;
         for (int i = 0; i < nqo; i++) {
@@ -2156,9 +3964,11 @@ static void do_quickopen(void) {
             idx[j+1] = ii; scr[j+1] = ss;
         }
         if (seln >= nm) seln = max2(0, nm - 1);
-        draw();
-        int bw = min2(COLS - 4, 64), lh = min2(12, max2(nm, 1));
-        int x0 = (COLS - bw) / 2, y0 = 2;
+        int bw = min2(COLS - 4, 64), y0 = 2;
+        /* fixed height: the panel neither jumps as you type nor leaves stale
+         * rows behind, which matters now that the app is not redrawn under it */
+        int lh = min2(12, max2(LINES - y0 - 3, 1));
+        int x0 = (COLS - bw) / 2;
         attron(COLOR_PAIR(CP_STATUS));
         move(y0, x0);
         for (int i = 0; i < bw; i++) addch(' ');
@@ -2177,6 +3987,7 @@ static void do_quickopen(void) {
         refresh();
         int c = read_key();
         if (c == 27) break;
+        if (c == KEY_RESIZE) { draw(); continue; }
         if (c == KEY_UP) { if (seln > 0) seln--; continue; }
         if (c == KEY_DOWN) { if (seln < min2(nm, lh) - 1) seln++; continue; }
         if (c == '\r' || c == '\n' || c == KEY_ENTER) {
@@ -2260,11 +4071,12 @@ static void do_complete(void) {
     if (!nw) { set_msg("no completions for %s", prefix); return; }
     qsort(w, (size_t)nw, sizeof(char *), str_cmp);
     int seln = 0;
+    draw();                       /* the app behind the list, once; the list
+                                   * is a fixed size, only the highlight moves */
     for (;;) {
-        draw();
         int show = min2(nw, 8);
         int py = 2 + (b->cy - b->rowoff);
-        int px = TREE_W + 2;
+        int px = tree_hidden ? 1 : tree_w + 2;
         if (py + show >= LINES - 1) py = max2(1, py - show - 1);
         int bw = 24;
         for (int i = 0; i < show; i++)
@@ -2352,11 +4164,26 @@ static void run_command(void) {
 /* ── app actions ──────────────────────────────────────────────────── */
 static void act_save(void) {
     if (cur < 0) return;
-    if (buf_save(tabs[cur]) == 0) set_msg("saved %s", tabs[cur]->name);
-    else                          set_msg("save failed: %s", tabs[cur]->path);
+    if (tabs[cur]->kind == TAB_TERM) { set_msg("nothing to save here", NULL); return; }
+    if (buf_save(tabs[cur]) == 0) {
+        set_msg("saved %s", tabs[cur]->name);
+        git_refresh();                     /* the file's status just changed */
+    } else set_msg("save failed: %s", tabs[cur]->path);
 }
 static void act_close(void) {
     if (cur < 0) return;
+    if (tabs[cur]->kind == TAB_TERM) {
+        /* a still-running shell is worth one confirmation */
+        Term *t = tabs[cur]->term;
+        if (t && !t->dead && !pending_close) {
+            pending_close = 1;
+            set_msg("shell still running — Alt+W again to kill it", NULL);
+            return;
+        }
+        close_tab(cur);
+        pending_close = 0;
+        return;
+    }
     if (tabs[cur]->dirty && !pending_close) {
         pending_close = 1;
         set_msg("unsaved changes — Alt+W again to discard", NULL);
@@ -2366,19 +4193,107 @@ static void act_close(void) {
     pending_close = 0;
 }
 static int act_quit(void) {
-    int dirty = 0;
-    for (int i = 0; i < ntabs; i++) dirty |= tabs[i]->dirty;
-    if (dirty && !pending_quit) {
+    int dirty = 0, shells = 0;
+    for (int i = 0; i < ntabs; i++) {
+        if (tabs[i]->kind == TAB_TERM) {
+            if (tabs[i]->term && !tabs[i]->term->dead) shells++;
+        } else dirty |= tabs[i]->dirty;
+    }
+    if ((dirty || shells) && !pending_quit) {
         pending_quit = 1;
-        set_msg("unsaved changes — Alt+Q again to quit anyway", NULL);
+        if (dirty) set_msg("unsaved changes — Alt+Q again to quit anyway", NULL);
+        else       set_msg("shells still running — Alt+Q again to quit", NULL);
         return 0;
     }
     return 1;
 }
 
 /* ── main ─────────────────────────────────────────────────────────── */
+/* Build a tree-sitter grammar from its upstream repo and install it, with the
+ * matching highlight query, where ts_for() looks. Needs git and a compiler.
+ * Grammars are not packaged consistently across distros — on Arch there is no
+ * tree-sitter-cpp package at all — so sds ships this rather than assume. */
+static int fetch_grammar(const char *lang) {
+#ifndef SDS_TREESITTER
+    (void)lang;
+    fprintf(stderr, "sds: built without tree-sitter support\n"
+                    "     rebuild with -DSDS_TREESITTER (see install.sh)\n");
+    return 1;
+#else
+    char gdir[PATH_MAX - 64], qdir[PATH_MAX - 64], tmp[256], cmd[PATH_MAX * 8];
+    for (const char *p = lang; *p; p++)
+        if (!isalnum((unsigned char)*p) && *p != '_') {
+            fprintf(stderr, "sds: bad grammar name: %s\n", lang);
+            return 1;
+        }
+    ts_data_dir(gdir, sizeof gdir, "grammars");
+    ts_data_dir(qdir, sizeof qdir, "queries");
+    snprintf(tmp, sizeof tmp, "/tmp/sds-grammar-%s.%d", lang, (int)getpid());
+
+    snprintf(cmd, sizeof cmd,
+        "set -e\n"
+        "mkdir -p '%s' '%s/%s'\n"
+        "rm -rf '%s'\n"
+        "git clone --depth 1 -q https://github.com/tree-sitter/tree-sitter-%s '%s'\n"
+        "cd '%s'\n"
+        "src=src\n"
+        "[ -d bindings ] || true\n"
+        "cc -O2 -fPIC -shared -I \"$src\" -o '%s/libtree-sitter-%s.so' \\\n"
+        "   \"$src\"/parser.c $([ -f \"$src/scanner.c\" ] && echo \"$src/scanner.c\")\n"
+        "cp queries/highlights.scm '%s/%s/highlights.scm'\n"
+        "cd / && rm -rf '%s'\n",
+        gdir, qdir, lang, tmp, lang, tmp, tmp, gdir, lang, qdir, lang, tmp);
+
+    printf("fetching tree-sitter-%s …\n", lang);
+    int st = system(cmd);
+    if (st != 0) {
+        fprintf(stderr, "sds: could not install grammar for %s\n", lang);
+        return 1;
+    }
+    printf("installed %s/libtree-sitter-%s.so\n", gdir, lang);
+    printf("installed %s/%s/highlights.scm\n", qdir, lang);
+
+    /* A language whose query inherits another needs that one's rules too,
+     * or e.g. C++ loses all its primitive-type highlighting. */
+    const char *par = ts_parent_of(lang);
+    if (par) {
+        char pq[PATH_MAX];
+        snprintf(pq, sizeof pq, "%s/%s/highlights.scm", qdir, par);
+        if (access(pq, F_OK) != 0) {
+            printf("%s inherits %s — fetching its query too\n", lang, par);
+            snprintf(cmd, sizeof cmd,
+                "set -e\n"
+                "mkdir -p '%s/%s'\n"
+                "rm -rf '%s'\n"
+                "git clone --depth 1 -q "
+                "https://github.com/tree-sitter/tree-sitter-%s '%s'\n"
+                "cp '%s/queries/highlights.scm' '%s/%s/highlights.scm'\n"
+                "rm -rf '%s'\n",
+                qdir, par, tmp, par, tmp, tmp, qdir, par, tmp);
+            if (system(cmd) == 0) printf("installed %s/%s/highlights.scm\n", qdir, par);
+            else fprintf(stderr, "sds: warning: could not fetch %s query\n", par);
+        }
+    }
+    return 0;
+#endif
+}
+
 int main(int argc, char **argv) {
     setlocale(LC_ALL, "");
+    if (argc > 1 && !strcmp(argv[1], "--fetch-grammar")) {
+        if (argc < 3) { fprintf(stderr, "usage: sds --fetch-grammar <lang>\n"); return 1; }
+        return fetch_grammar(argv[2]);
+    }
+    if (argc > 1 && (!strcmp(argv[1], "--version") || !strcmp(argv[1], "-v"))) {
+        printf("sds (SimpleDevSuite)  tree-sitter: %s\n",
+#ifdef SDS_TREESITTER
+               "enabled"
+#else
+               "not built in"
+#endif
+        );
+        return 0;
+    }
     const char *dir = argc > 1 ? argv[1] : ".";
     char rp[PATH_MAX];
     if (!realpath(dir, rp)) { fprintf(stderr, "sds: bad path: %s\n", dir); return 1; }
@@ -2389,11 +4304,14 @@ int main(int argc, char **argv) {
     }
     if (chdir(rp) != 0) { /* non-fatal */ }
 
+    cfg_load();
+    kw_index_build();
     hist_load();
 
     root = node_new("", rp, 1, NULL);
     node_load(root);
     tree_rebuild();
+    git_refresh();
 
     initscr();
     raw();
@@ -2420,59 +4338,97 @@ int main(int argc, char **argv) {
     if (has_colors()) {
         start_color();
         use_default_colors();
-        init_pair(CP_TAB_ACT, COLOR_BLACK,   COLOR_YELLOW);
-        init_pair(CP_TAB,     COLOR_WHITE,   COLOR_BLACK);
-        init_pair(CP_SEL,     COLOR_BLACK,   COLOR_YELLOW);
-        init_pair(CP_DIR,     COLOR_CYAN,    -1);
-        init_pair(CP_STATUS,  COLOR_BLACK,   COLOR_WHITE);
-        init_pair(CP_LINENO,  COLOR_YELLOW,  -1);
-        init_pair(CP_MUTED,   COLOR_BLUE,    -1);
-        init_pair(CP_KW,      COLOR_MAGENTA, -1);
-        init_pair(CP_TYPE,    COLOR_CYAN,    -1);
-        init_pair(CP_STR,     COLOR_GREEN,   -1);
-        init_pair(CP_COM,     COLOR_BLUE,    -1);
-        init_pair(CP_NUM,     COLOR_RED,     -1);
-        init_pair(CP_PRE,     COLOR_CYAN,    -1);
-        init_pair(CP_FIND,    COLOR_BLACK,   COLOR_GREEN);
-        init_pair(CP_ERR,     COLOR_WHITE,   COLOR_RED);
+        apply_theme();
     }
+    if (tree_autohide > 0 && COLS < tree_autohide) tree_hidden = 1;
+    if (cfg_warn[0]) set_msg("%s", cfg_warn);
 
+    int need_draw = 1;
     for (;;) {
-        draw();
-        int c = read_key();
-        if (c == K_NONE || c == ERR || c == KEY_RESIZE) continue;
+        /* With a live shell the loop must not block in getch(), or its output
+         * would only appear when a key is pressed. Poll instead, and redraw
+         * only when something actually changed. */
+        int live = any_live_term();
+        g_timeout = live ? 20 : -1;
+        timeout(g_timeout);
+
+        if (need_draw) { draw(); need_draw = 0; }
+        int c = read_key_raw();
+        if (c == ERR) {                       /* poll tick, no key */
+            if (pump_all_terms()) need_draw = 1;
+            continue;
+        }
+        if (pump_all_terms()) need_draw = 1;
+        need_draw = 1;
+        if (c == K_NONE || c == KEY_RESIZE) continue;
         if (show_help) { show_help = 0; continue; }
-        if (c != ALT('w')) pending_close = 0;
-        if (c != ALT('q')) pending_quit = 0;
+
+        /* a focused terminal swallows everything except the app-level keys */
+        if (cur >= 0 && tabs[cur]->kind == TAB_TERM) {
+            Term *t = tabs[cur]->term;
+            if (c == MK(2, D_UP) || c == KEY_SPREVIOUS) {      /* Shift+PgUp */
+                if (t) t->sb_view = min2(t->sb_n, t->sb_view + t->rows / 2);
+                continue;
+            }
+            if (c == MK(2, D_DOWN) || c == KEY_SNEXT) {
+                if (t) t->sb_view = max2(0, t->sb_view - t->rows / 2);
+                continue;
+            }
+            int app = (c == kb[KB_QUIT] || c == kb[KB_CLOSE_TAB] ||
+                       c == kb[KB_HELP] || c == kb[KB_TERM] ||
+                       c == kb[KB_TAB_PREV] || c == kb[KB_TAB_NEXT] ||
+                       c == kb[KB_SIDEBAR] || c == kb[KB_QUICKOPEN] ||
+                       c == kb[KB_TREE_UP] || c == kb[KB_TREE_DOWN] ||
+                       c == kb[KB_TREE_OPEN] || c == kb[KB_TREE_COLLAPSE] ||
+                       c == kb[KB_TREE_EXPAND] ||
+                       (c >= ALT('1') && c <= ALT('9')));
+            if (!app) {
+                if (t && !t->dead) term_key(t, c);
+                else if (t && t->dead && c != K_NONE)
+                    set_msg("shell exited — Alt+W closes this tab", NULL);
+                continue;
+            }
+        }
+
+        if (c != kb[KB_CLOSE_TAB]) pending_close = 0;
+        if (c != kb[KB_QUIT])      pending_quit = 0;
         msg[0] = 0;
 
-        /* ── app-level (Alt & friends) ── */
-        switch (c) {
-            case MK(3, D_UP):    if (tsel > 0) tsel--;        continue;
-            case MK(3, D_DOWN):  if (tsel < nvis - 1) tsel++; continue;
-            case MK(3, D_LEFT):  tree_collapse();             continue;
-            case MK(3, D_RIGHT): tree_expand();               continue;
-            case ALT('\n'):      tree_open_selected();        continue;
-            case K_ADEL:         tree_delete_selected();      continue;
-            case K_AINS:         tree_new_entry();            continue;
-            case KEY_F(5): case ALT('e'):
-                tree_refresh(); set_msg("tree refreshed", NULL); continue;
-            case ALT(','): case ALT('['):
-                if (ntabs) { cur = (cur + ntabs - 1) % ntabs; } continue;
-            case ALT('.'): case ALT(']'):
-                if (ntabs) { cur = (cur + 1) % ntabs; }         continue;
-            case ALT('w'):  act_close();                      continue;
-            case ALT('s'):  act_save();                       continue;
-            case ALT('h'):  show_help = 1;                    continue;
-            case ALT('r'):  run_command();                    continue;
-            case ALT('q'):  if (act_quit()) goto done;        continue;
-            case CTRL('s'): act_save();                       continue;
-            case CTRL('p'): do_quickopen();                   continue;
-            case ALT('z'):
-                wrap = !wrap;
-                for (int i = 0; i < ntabs; i++) tabs[i]->subrow = 0;
-                set_msg(wrap ? "word wrap on" : "word wrap off", NULL);
-                continue;
+        /* ── app-level ── */
+        /* An if-chain rather than a switch: the bindings come from the config
+         * at runtime, so they are not case-label constants. The second key on
+         * some lines is a fixed alias that has always worked. */
+        if (c == kb[KB_TREE_UP])         { if (tsel > 0) tsel--;        continue; }
+        if (c == kb[KB_TREE_DOWN])       { if (tsel < nvis - 1) tsel++; continue; }
+        if (c == kb[KB_TREE_COLLAPSE])   { tree_collapse();             continue; }
+        if (c == kb[KB_TREE_EXPAND])     { tree_expand();               continue; }
+        if (c == kb[KB_TREE_OPEN])       { tree_open_selected();        continue; }
+        if (c == kb[KB_DEL_ENTRY])       { tree_delete_selected();      continue; }
+        if (c == kb[KB_NEW_ENTRY])       { tree_new_entry();            continue; }
+        if (c == kb[KB_REFRESH] || c == ALT('e')) {
+            tree_refresh(); set_msg("tree refreshed", NULL);            continue;
+        }
+        if (c == kb[KB_TAB_PREV] || c == ALT('[')) {
+            if (ntabs) cur = (cur + ntabs - 1) % ntabs;
+            continue;
+        }
+        if (c == kb[KB_TAB_NEXT] || c == ALT(']')) {
+            if (ntabs) cur = (cur + 1) % ntabs;
+            continue;
+        }
+        if (c == kb[KB_TERM])            { open_terminal();             continue; }
+        if (c == kb[KB_CLOSE_TAB])       { act_close();                 continue; }
+        if (c == kb[KB_SAVE] || c == ALT('s')) { act_save();            continue; }
+        if (c == kb[KB_HELP])            { show_help = 1;               continue; }
+        if (c == kb[KB_RUN])             { run_command();               continue; }
+        if (c == kb[KB_QUIT])            { if (act_quit()) goto done;   continue; }
+        if (c == kb[KB_QUICKOPEN])       { do_quickopen();              continue; }
+        if (c == kb[KB_SIDEBAR])         { tree_toggle();               continue; }
+        if (c == kb[KB_WRAP]) {
+            wrap = !wrap;
+            for (int i = 0; i < ntabs; i++) tabs[i]->subrow = 0;
+            set_msg(wrap ? "word wrap on" : "word wrap off", NULL);
+            continue;
         }
         if (c >= ALT('1') && c <= ALT('9')) {
             int i = c - ALT('1');
@@ -2483,10 +4439,18 @@ int main(int argc, char **argv) {
 
         /* ── editor ── */
         if (cur < 0) {
-            if (c == CTRL('f') || c == CTRL('g')) set_msg("open a file first", NULL);
+            if (c == kb[KB_FIND] || c == kb[KB_GOTO])
+                set_msg("open a file first", NULL);
             continue;
         }
+        if (tabs[cur]->kind != TAB_FILE) continue;   /* terminals handled above */
         Buf *b = tabs[cur];
+        /* configurable editor actions, again as an if-chain */
+        if (c == kb[KB_FIND])      { do_find();     continue; }
+        if (c == kb[KB_FIND_NEXT]) { find_next();   continue; }
+        if (c == kb[KB_REPLACE])   { do_replace();  continue; }
+        if (c == kb[KB_GOTO])      { do_goto();     continue; }
+        if (c == kb[KB_COMPLETE])  { do_complete(); continue; }
         switch (c) {
             /* movement */
             case KEY_UP:        move_cursor(b, M_UP, 0);      break;
@@ -2555,12 +4519,6 @@ int main(int argc, char **argv) {
             case CTRL('k'):                       ed_del_line(b);  break;
             case 31: /* Ctrl+/ */                 ed_toggle_comment(b); break;
             case ALT('o'):                        ed_open_below(b); break;
-            /* find & go */
-            case CTRL('f'):                       do_find();       break;
-            case KEY_F(3):                        find_next();     break;
-            case CTRL('r'):                       do_replace();    break;
-            case CTRL('g'):                       do_goto();       break;
-            case 0: /* Ctrl+Space */              do_complete();   break;
             case 27:
                 b->sel = 0; find_show = 0;
                 break;
