@@ -4,6 +4,8 @@
 # tree-sitter is optional. When the library is present sds uses it for syntax
 # highlighting (grammars are loaded at runtime — see `sds --fetch-grammar`);
 # otherwise it falls back to its own keyword lexer and everything still works.
+#
+# zlib is required: the PDF viewer needs it to inflate page streams.
 set -e
 
 BIN="$HOME/.local/bin"
@@ -13,12 +15,12 @@ build() {
     if pkg-config --exists tree-sitter 2>/dev/null; then
         echo "building with tree-sitter support"
         cc -O2 -Wall -DSDS_TREESITTER -o sds sds.c \
-            $(pkg-config --cflags tree-sitter) -lncursesw -lutil \
+            $(pkg-config --cflags tree-sitter) -lncursesw -lutil -lz \
             $(pkg-config --libs tree-sitter) -ldl
     else
         echo "tree-sitter not found — building with the built-in lexer"
         echo "  (install it and re-run to enable tree-sitter highlighting)"
-        cc -O2 -Wall -o sds sds.c -lncursesw -lutil
+        cc -O2 -Wall -o sds sds.c -lncursesw -lutil -lz
     fi
 }
 
@@ -41,10 +43,10 @@ git clone git@github.com:kalaspuffarna/SimpleDevSuite.git
 cd SimpleDevSuite
 if pkg-config --exists tree-sitter 2>/dev/null; then
     cc -O2 -Wall -DSDS_TREESITTER -o sds sds.c \
-        $(pkg-config --cflags tree-sitter) -lncursesw -lutil \
+        $(pkg-config --cflags tree-sitter) -lncursesw -lutil -lz \
         $(pkg-config --libs tree-sitter) -ldl
 else
-    cc -O2 -Wall -o sds sds.c -lncursesw -lutil
+    cc -O2 -Wall -o sds sds.c -lncursesw -lutil -lz
 fi
 mkdir -p "$HOME/.local/c_bin"
 mv sds "$HOME/.local/c_bin/sds"
