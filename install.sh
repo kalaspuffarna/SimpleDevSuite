@@ -6,6 +6,11 @@
 # otherwise it falls back to its own keyword lexer and everything still works.
 #
 # zlib is required: the PDF viewer needs it to inflate page streams.
+#
+# To see rendered PDF pages rather than extracted text you also need one of
+# mupdf-tools, poppler or ghostscript, and a terminal that speaks the kitty
+# graphics protocol (kitty, ghostty, WezTerm, iTerm2). Without them sds shows
+# the extracted text and says what is missing.
 set -e
 
 BIN="$HOME/.local/bin"

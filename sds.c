@@ -306,6 +306,7 @@ typedef struct {
     int   kind;                /* TAB_FILE, TAB_TERM or TAB_PDF */
     Term *term;                /* set when kind == TAB_TERM */
     Pdf  *pdf;                 /* set when kind == TAB_PDF  */
+    int   pdf_img;             /* PDF tab showing the rendered page  */
     char  path[PATH_MAX];
     char  name[NAME_MAX + 1];
     const Lang *lang;
@@ -350,6 +351,10 @@ static int   ntabs = 0, cur = -1;
 #define MAX_PANES 4
 static int panes[MAX_PANES] = { -1, -1, -1, -1 };
 static int npanes = 1, curpane = 0;
+
+/* PDF page rendering (see the graphics section further down) */
+static int cfg_pdf_render = 1;          /* config [pdf] render */
+static const char *pdf_render_why_not(void);   /* NULL when a page can be shown */
 
 static Node *root = NULL;
 static Node **vis = NULL;
@@ -729,6 +734,19 @@ typedef struct {
 
 typedef struct { PSpan dict, res; double mb[4]; } PdfPage;
 
+/* `dir` is the quadrant the baseline advances in: 0 = +x, 1 = +y, 2 = -x,
+ * 3 = -y. Layout rotates the page so the commonest one reads left to right,
+ * which is what makes sideways scans and /Rotate'd pages legible. */
+typedef struct { double x, y, h, w; char *s; int len; int dir; } PFrag;
+
+typedef struct {
+    PFrag  *f; int nf, fcap;
+    int    *row; int nrow;         /* row k spans f[row[k] .. row[k+1]) */
+    double  unit, left;            /* column width and page left edge, in pt */
+    struct { const char *key; char nm[64]; PdfFont f; } fc[24];
+    int nfc;
+} PdfOut;
+
 struct Pdf {
     char    *raw; size_t rawlen;
     PSpan   *obj; int nobj;
@@ -736,6 +754,10 @@ struct Pdf {
     PdfPage *pg;  int npg;
     int      page;                 /* 0-based */
     int      encrypted;
+    /* Extracting a page is the expensive half and does not depend on how wide
+     * the pane is, so the fragments are kept and only re-flowed on a resize. */
+    PdfOut   out;
+    int      laid_w;               /* width b->ln was last laid out for */
 };
 
 /* ── lexing ───────────────────────────────────────────────────────── */
@@ -1559,18 +1581,7 @@ static void pdf_font_load(Pdf *pdf, PSpan fd, PdfFont *f) {
     }
 }
 
-/* ── content streams ──────────────────────────────────────────────── */
-/* `dir` is the quadrant the baseline advances in: 0 = +x, 1 = +y, 2 = -x,
- * 3 = -y. The layout rotates the page so the commonest one reads left to
- * right, which is what makes sideways scans and /Rotate'd pages legible. */
-typedef struct { double x, y, h, w; char *s; int len; int dir; } PFrag;
-
-typedef struct {
-    PFrag  *f; int nf, fcap;
-    struct { const char *key; char nm[64]; PdfFont f; } fc[24];
-    int nfc;
-} PdfOut;
-
+/* ── content streams ─────────────────────────────────────────────── */
 static void mmul(const double *a, const double *b, double *r) {   /* r = a × b */
     double t[6];
     t[0] = a[0]*b[0] + a[1]*b[2];
@@ -1851,11 +1862,15 @@ static int pdf_nchars(const char *s, int len) {
     for (int i = 0; i < len; i++) if (((unsigned char)s[i] & 0xc0) != 0x80) n++;
     return n;
 }
-/* Fragments → text lines. Rows come from vertical proximity, columns from
- * dividing the horizontal offset by a typical character width, so tables and
- * indentation survive roughly intact. */
-static void pdf_layout(PdfOut *o, Buf *b) {
+/* Rotate the page upright, sort into reading order, group rows and pick a
+ * column unit. All of this is width-independent, so it happens once per page
+ * and a resize only re-runs pdf_layout(). */
+static void pdf_prepare(PdfOut *o) {
+    o->unit = 5.0;
+    o->left = 0;
+    o->nrow = 0;
     if (o->nf == 0) return;
+
     /* Turn the page so the dominant baseline direction reads left to right.
      * Weighting by character count keeps a sideways stamp or margin label
      * from out-voting the body text. */
@@ -1881,20 +1896,18 @@ static void pdf_layout(PdfOut *o, Buf *b) {
         int nc = pdf_nchars(o->f[i].s, o->f[i].len);
         if (nc > 0 && o->f[i].w > 0.01) samp[ns++] = o->f[i].w / nc;
     }
-    double unit = 5.0;
     if (ns) {
         qsort(samp, (size_t)ns, sizeof *samp, dcmp);
-        unit = samp[ns / 2];
+        o->unit = samp[ns / 2];
     }
     free(samp);
-    if (unit < 0.5) unit = 0.5;
+    if (o->unit < 0.5) o->unit = 0.5;
 
-    double left = o->f[0].x;
-    for (int i = 1; i < o->nf; i++) if (o->f[i].x < left) left = o->f[i].x;
+    o->left = o->f[0].x;
+    for (int i = 1; i < o->nf; i++) if (o->f[i].x < o->left) o->left = o->f[i].x;
 
-    char *line = xmalloc(PDF_MAXCOL + 8);
-    double prev_y = 0, prev_h = 0;
-    int first = 1;
+    /* group into rows by vertical proximity, then order each row by x */
+    o->row = xmalloc((size_t)(o->nf + 1) * sizeof *o->row);
     for (int i = 0; i < o->nf; ) {
         double rowy = o->f[i].y, rowh = o->f[i].h;
         int j = i + 1;
@@ -1906,44 +1919,194 @@ static void pdf_layout(PdfOut *o, Buf *b) {
             if (o->f[j].h > rowh) rowh = o->f[j].h;
         }
         qsort(o->f + i, (size_t)(j - i), sizeof *o->f, pfrag_xcmp);
+        o->row[o->nrow++] = i;
+        i = j;
+    }
+    o->row[o->nrow] = o->nf;
+}
+/* Render one row into `line` at the given column unit. Used both to measure
+ * the page's natural width and to emit it, so the two always agree. */
+static int pdf_row_build(PdfOut *o, int k, double unit, char *line, int cap) {
+    int len = 0;
+    double pen = o->left;
+    for (int i = o->row[k]; i < o->row[k + 1]; i++) {
+        PFrag *g = &o->f[i];
+        int col = (int)((g->x - o->left) / unit + 0.5);
+        if (col < 0) col = 0;
+        if (col > len) {
+            int pad = min2(col, cap - 1) - len;
+            for (int s = 0; s < pad; s++) line[len++] = ' ';
+        } else if (len > 0 && line[len - 1] != ' ' && g->x - pen > unit * 0.28) {
+            if (len < cap) line[len++] = ' ';
+        }
+        for (int s = 0; s < g->len && len < cap; s++) {
+            char ch = g->s[s];
+            line[len++] = (ch == '\n' || ch == '\r' || ch == '\f') ? ' ' : ch;
+        }
+        pen = g->x + g->w;
+    }
+    while (len > 0 && line[len - 1] == ' ') len--;
+    return len;
+}
+/* Append a row, wrapping it to `width` so a narrow pane never needs sideways
+ * scrolling. Continuation lines keep the row's own indent, which holds bullet
+ * lists and indented blocks together. Breaking on bytes is deliberate: the
+ * editor measures columns in bytes too, and a multi-byte character draws
+ * narrower than it measures, so a byte-wrapped line always fits. */
+static void pdf_emit(Buf *b, const char *s, int len, int width) {
+    if (width <= 0 || len <= width) { buf_insert_line(b, b->n, s, len); return; }
+    int lead = 0;
+    while (lead < len && s[lead] == ' ') lead++;
+    int cont = min2(lead, width / 3);
+    char *tmp = xmalloc((size_t)width + 8);
+    for (int start = 0, ind = 0; start < len; ) {
+        int room = width - ind;
+        if (room < 8) { ind = 0; room = width; }
+        int take;
+        if (len - start <= room) {
+            take = len - start;
+        } else {
+            int brk = -1;
+            for (int k = start + room; k > start; k--)
+                if (s[k] == ' ') { brk = k; break; }
+            if (brk > start) take = brk - start;
+            else {                      /* one long word: split on a char edge */
+                take = room;
+                while (take > 1 && ((unsigned char)s[start + take] & 0xc0) == 0x80)
+                    take--;
+            }
+        }
+        int n = 0;
+        for (int i = 0; i < ind; i++) tmp[n++] = ' ';
+        memcpy(tmp + n, s + start, (size_t)take);
+        n += take;
+        while (n > 0 && tmp[n - 1] == ' ') n--;
+        buf_insert_line(b, b->n, tmp, n);
+        start += take;
+        while (start < len && s[start] == ' ') start++;
+        ind = cont;
+    }
+    free(tmp);
+}
+/* Does this row look like a table or a two-column layout rather than prose?
+ * A run of three spaces inside the text means the fragments were placed apart
+ * on purpose, and joining such rows into a paragraph would scramble them. */
+static int pdf_row_tabular(const char *s, int len) {
+    int i = 0;
+    while (i < len && s[i] == ' ') i++;
+    for (int run = 0; i < len; i++) {
+        if (s[i] == ' ') { if (++run >= 3) return 1; }
+        else run = 0;
+    }
+    return 0;
+}
+/* Fragments → text lines at a target width. Columns come from dividing the
+ * horizontal offset by a typical character width, so tables and indentation
+ * survive. When the page is wider than the pane the gaps are squeezed first;
+ * if that is not enough, prose paragraphs are re-flowed as a whole rather
+ * than wrapped line by line, which would leave a short orphan after every
+ * source line. A page that already fits is emitted untouched.
+ * width <= 0 means "no fitting at all". */
+static void pdf_layout(PdfOut *o, Buf *b, int width) {
+    if (o->nf <= 0 || o->nrow <= 0 || o->nrow > o->nf || o->nf > PDF_MAXFRAG)
+        return;
+    char *line = xmalloc(PDF_MAXCOL + 8);
+    double unit = o->unit;
+    int narrowed = 0;
 
-        if (!first) {                    /* keep paragraph breaks visible */
-            double gap = prev_y - rowy;
-            double ref = (prev_h > rowh ? prev_h : rowh);
+    if (width > 0) {
+        /* Squeeze inter-column gaps until the widest row fits. Text itself
+         * cannot shrink, so this converges on the all-text width; whatever is
+         * still over gets re-flowed below. */
+        for (int pass = 0; pass < 3; pass++) {
+            int wide = 0;
+            for (int k = 0; k < o->nrow; k++) {
+                int n = pdf_row_build(o, k, unit, line, PDF_MAXCOL);
+                if (n > wide) wide = n;
+            }
+            if (wide <= width) break;
+            narrowed = 1;
+            double grow = (double)wide / width;
+            if (grow < 1.02) break;
+            unit *= grow;
+        }
+    }
+    /* materialise every row once: the join pass needs to look ahead */
+    typedef struct { char *s; int len, col, tab; double y, h; } PRow;
+    PRow *R = xmalloc((size_t)o->nrow * sizeof *R);
+    int body = 1;
+    for (int k = 0; k < o->nrow; k++) {
+        int len = pdf_row_build(o, k, unit, line, PDF_MAXCOL);
+        R[k].len = len;
+        R[k].s = xmalloc((size_t)len + 1);
+        memcpy(R[k].s, line, (size_t)len);
+        R[k].s[len] = 0;
+        int c = 0;
+        while (c < len && line[c] == ' ') c++;
+        R[k].col = c;
+        R[k].tab = pdf_row_tabular(line, len);
+        int i = o->row[k];
+        R[k].y = o->f[i].y;
+        R[k].h = o->f[i].h;
+        for (int j = i + 1; j < o->row[k + 1]; j++)
+            if (o->f[j].h > R[k].h) R[k].h = o->f[j].h;
+        if (len > body) body = len;
+    }
+    free(line);
+
+    char *para = xmalloc((size_t)PDF_MAXCOL * 4 + 8);
+    for (int k = 0; k < o->nrow; ) {
+        if (k) {                            /* keep paragraph breaks visible */
+            double gap = R[k - 1].y - R[k].y;
+            double ref = (R[k - 1].h > R[k].h ? R[k - 1].h : R[k].h);
             if (ref > 0.01 && gap > ref * 1.7) {
                 buf_insert_line(b, b->n, "", 0);
                 if (gap > ref * 4.0) buf_insert_line(b, b->n, "", 0);
             }
         }
-        int len = 0;
-        double pen = left;               /* device x already written out */
-        for (int k = i; k < j; k++) {
-            PFrag *g = &o->f[k];
-            int col = (int)((g->x - left) / unit + 0.5);
-            if (col < 0) col = 0;
-            if (col > len) {
-                int pad = min2(col, PDF_MAXCOL - 1) - len;
-                for (int s = 0; s < pad; s++) line[len++] = ' ';
-            } else if (len > 0 && line[len - 1] != ' ' && g->x - pen > unit * 0.28) {
-                if (len < PDF_MAXCOL) line[len++] = ' ';
-            }
-            for (int s = 0; s < g->len && len < PDF_MAXCOL; s++) {
-                char ch = g->s[s];
-                line[len++] = (ch == '\n' || ch == '\r' || ch == '\f') ? ' ' : ch;
-            }
-            pen = g->x + g->w;
+        int plen = R[k].len;
+        memcpy(para, R[k].s, (size_t)plen);
+        int last = k;
+        /* Pull following rows into this paragraph only when we had to narrow
+         * the page — at full width the PDF's own line breaks are the truth. */
+        while (narrowed && !R[last].tab && last + 1 < o->nrow) {
+            int n = last + 1;
+            double gap = R[last].y - R[n].y;
+            double ref = (R[last].h > R[n].h ? R[last].h : R[n].h);
+            int indent_ok = (n == k + 1) ? (R[n].col <= R[k].col + 1)
+                                         : (R[n].col == R[last].col);
+            double hr = R[n].h > 0.01 ? R[last].h / R[n].h : 1.0;
+            if (R[n].tab || R[n].len == 0) break;
+            if (ref > 0.01 && gap > ref * 1.7) break;      /* blank line ahead */
+            if (!indent_ok) break;
+            if (hr < 0.8 || hr > 1.25) break;              /* heading, not body */
+            if (R[last].len < body * 72 / 100) break;      /* short = para end */
+            int add = R[n].len - R[n].col;
+            if (plen + 1 + add > PDF_MAXCOL * 4) break;
+            para[plen++] = ' ';
+            memcpy(para + plen, R[n].s + R[n].col, (size_t)add);
+            plen += add;
+            last = n;
         }
-        while (len > 0 && line[len - 1] == ' ') len--;
-        buf_insert_line(b, b->n, line, len);
-        prev_y = rowy; prev_h = rowh; first = 0;
-        i = j;
+        pdf_emit(b, para, plen, width);
+        for (int i = k; i <= last; i++) free(R[i].s);
+        k = last + 1;
     }
-    free(line);
+    free(para);
+    free(R);
 }
 
 /* ── page → buffer ────────────────────────────────────────────────── */
+static void pdf_out_clear(PdfOut *o) {
+    for (int i = 0; i < o->nf; i++) free(o->f[i].s);
+    free(o->f);
+    free(o->row);
+    for (int i = 0; i < o->nfc; i++) pdf_font_free(&o->fc[i].f);
+    memset(o, 0, sizeof *o);
+}
 static void pdf_free(Pdf *p) {
     if (!p) return;
+    pdf_out_clear(&p->out);
     for (int i = 0; i < p->nblob; i++) free(p->blob[i]);
     free(p->blob);
     free(p->obj);
@@ -1983,37 +2146,20 @@ static char *pdf_contents(Pdf *pdf, PSpan page, size_t *outlen) {
     *outlen = n;
     return all;
 }
-static void pdf_page_into(Buf *b, int page) {
+/* Re-flow the cached page to `width` columns. Cheap: no re-parsing. */
+static void pdf_relayout(Buf *b, int width) {
     Pdf *pdf = b->pdf;
     for (int i = 0; i < b->n; i++) free(b->ln[i].s);
     b->n = 0;
-    b->cy = b->cx = b->rowoff = b->coloff = b->subrow = 0;
-    b->sel = 0;
     b->hl_upto = 0;
     b->ver++;
-    if (page < 0) page = 0;
-    if (page >= pdf->npg) page = pdf->npg - 1;
-    pdf->page = page;
+    pdf->laid_w = width;
 
     if (pdf->npg <= 0) {
         buf_insert_line(b, 0, "  no pages found in this PDF", 28);
         return;
     }
-    PdfPage *g = &pdf->pg[page];
-    size_t n;
-    char *body = pdf_contents(pdf, g->dict, &n);
-    PdfOut o;
-    memset(&o, 0, sizeof o);
-    if (body) {
-        double ctm[6] = { 1, 0, 0, 1, 0, 0 };
-        pdf_run(pdf, body, body + n, g->res, ctm, &o, 0);
-        free(body);
-    }
-    pdf_layout(&o, b);
-    for (int i = 0; i < o.nf; i++) free(o.f[i].s);
-    free(o.f);
-    for (int i = 0; i < o.nfc; i++) pdf_font_free(&o.fc[i].f);
-
+    pdf_layout(&pdf->out, b, width);
     if (b->n == 0) {
         const char *m = pdf->encrypted
             ? "  this PDF is encrypted — sds cannot extract its text"
@@ -2021,6 +2167,35 @@ static void pdf_page_into(Buf *b, int page) {
         buf_insert_line(b, 0, m, (int)strlen(m));
     }
     if (b->n == 0) buf_insert_line(b, 0, "", 0);
+    if (b->cy >= b->n) b->cy = b->n - 1;
+    if (b->cy < 0) b->cy = 0;
+    if (b->cx > b->ln[b->cy].len) b->cx = b->ln[b->cy].len;
+    if (b->rowoff > b->n - 1) b->rowoff = max2(0, b->n - 1);
+    b->coloff = 0;
+    b->sel = 0;
+}
+/* Extract `page` and lay it out. The extraction is the slow half, so it is
+ * cached in pdf->out and reused by pdf_relayout() on every resize. */
+static void pdf_page_into(Buf *b, int page) {
+    Pdf *pdf = b->pdf;
+    b->cy = b->cx = b->rowoff = b->coloff = b->subrow = 0;
+    if (page < 0) page = 0;
+    if (page >= pdf->npg) page = pdf->npg - 1;
+    pdf->page = page;
+
+    pdf_out_clear(&pdf->out);
+    if (pdf->npg > 0) {
+        PdfPage *g = &pdf->pg[page];
+        size_t n;
+        char *body = pdf_contents(pdf, g->dict, &n);
+        if (body) {
+            double ctm[6] = { 1, 0, 0, 1, 0, 0 };
+            pdf_run(pdf, body, body + n, g->res, ctm, &pdf->out, 0);
+            free(body);
+        }
+        pdf_prepare(&pdf->out);
+    }
+    pdf_relayout(b, pdf->laid_w);
 }
 static Buf *pdf_load(const char *path) {
     FILE *f = fopen(path, "rb");
@@ -2052,6 +2227,11 @@ static Buf *pdf_load(const char *path) {
     b->lang = LANG_TEXT;
     b->kind = TAB_PDF;
     b->pdf = pdf;
+    /* Show the real page when the terminal and a rasterizer allow it; say why
+     * when they do not, rather than silently dropping to text. */
+    const char *why = pdf_render_why_not();
+    b->pdf_img = (why == NULL);
+    if (why) set_msg("%s", why);
     pdf_page_into(b, 0);
     return b;
 }
@@ -3225,6 +3405,13 @@ static const char *DEFAULT_CONFIG =
 "tab_width = 4        # render width of a tab character (1-16)\n"
 "soft_wrap = false    # start with word wrap on (toggle at runtime with Alt+Z)\n"
 "\n"
+"[pdf]\n"
+"# Show the real rendered page instead of extracted text, when the terminal\n"
+"# speaks the kitty graphics protocol (kitty, ghostty, WezTerm, iTerm2) and\n"
+"# one of mutool, pdftoppm or gs is installed. Falls back to text with a\n"
+"# message when either is missing. `v` toggles the two at runtime.\n"
+"render = on\n"
+"\n"
 "[tree]\n"
 "width = 30           # sidebar width in columns\n"
 "# Below this terminal width the sidebar hides itself so the editor stays\n"
@@ -3453,6 +3640,10 @@ static void cfg_load(void) {
                     } else if (!strcmp(k, "soft_wrap")) {
                         wrap = !strcmp(v, "true") || !strcmp(v, "1");
                     }
+                } else if (!strcmp(sect, "pdf")) {
+                    if (!strcmp(k, "render"))
+                        cfg_pdf_render = !(!strcmp(v, "false") ||
+                                           !strcmp(v, "off") || !strcmp(v, "0"));
                 } else if (!strcmp(sect, "tree")) {
                     if (!strcmp(k, "width")) {
                         int n = atoi(v);
@@ -4379,6 +4570,292 @@ static void draw_term(Buf *b, int ytop, int x0, int rows, int cols) {
         move(ytop + min2(t->cy, rows - 1), x0 + min2(t->cx, cols - 1));
 }
 
+/* ── rendering a page as an image ─────────────────────────────────────
+ * Terminals that speak the kitty graphics protocol (kitty, ghostty, WezTerm,
+ * iTerm2) can show the real page instead of extracted text. sds does not
+ * rasterize PDFs itself — that is a font engine and a path renderer, far more
+ * than this file should carry — so it shells out to whichever of mutool,
+ * pdftoppm or gs is installed, and says so plainly when none is.           */
+
+enum { RAST_NONE = 0, RAST_MUTOOL, RAST_PDFTOPPM, RAST_GS };
+static int  rast_kind = -1;          /* resolved on first use */
+static char rast_path[PATH_MAX];
+static int  gfx_ok = -1;             /* terminal speaks the protocol */
+
+static int have_exec(const char *name, char *out, size_t cap) {
+    const char *p = getenv("PATH");
+    if (!p || !*p) p = "/usr/bin:/bin";
+    while (*p) {
+        const char *c = strchr(p, ':');
+        size_t n = c ? (size_t)(c - p) : strlen(p);
+        if (n && n < cap) {
+            char buf[PATH_MAX];
+            snprintf(buf, sizeof buf, "%.*s/%s", (int)n, p, name);
+            if (access(buf, X_OK) == 0) { snprintf(out, cap, "%s", buf); return 1; }
+        }
+        if (!c) break;
+        p = c + 1;
+    }
+    return 0;
+}
+static int rast_find(void) {
+    if (rast_kind >= 0) return rast_kind;
+    if      (have_exec("mutool",   rast_path, sizeof rast_path)) rast_kind = RAST_MUTOOL;
+    else if (have_exec("pdftoppm", rast_path, sizeof rast_path)) rast_kind = RAST_PDFTOPPM;
+    else if (have_exec("gs",       rast_path, sizeof rast_path)) rast_kind = RAST_GS;
+    else rast_kind = RAST_NONE;
+    return rast_kind;
+}
+/* kitty, ghostty, WezTerm and iTerm2 all implement the protocol. There is a
+ * query handshake for this, but it means reading a reply mid-startup; the
+ * environment is reliable enough, and `render` in the config forces it. */
+static int gfx_detect(void) {
+    if (gfx_ok >= 0) return gfx_ok;
+    const char *t = getenv("TERM"), *p = getenv("TERM_PROGRAM");
+    gfx_ok = 0;
+    if (getenv("KITTY_WINDOW_ID")) gfx_ok = 1;
+    if (t && (strstr(t, "kitty") || strstr(t, "ghostty"))) gfx_ok = 1;
+    if (p && (!strcasecmp(p, "ghostty") || !strcasecmp(p, "WezTerm") ||
+              !strcasecmp(p, "iTerm.app"))) gfx_ok = 1;
+    return gfx_ok;
+}
+/* Why a page cannot be shown as an image, or NULL when it can. */
+static const char *pdf_render_why_not(void) {
+    if (!cfg_pdf_render) return "page rendering is off in the config";
+    if (!gfx_detect())
+        return "this terminal can't show images — needs kitty, ghostty or WezTerm";
+    if (rast_find() == RAST_NONE)
+        return "no PDF rasterizer found — install mupdf-tools, poppler or ghostscript";
+    return NULL;
+}
+/* Terminal cell size in pixels, so a page can be rasterized to fit exactly. */
+static void cell_px(int *cw, int *ch) {
+    struct winsize ws;
+    *cw = 8; *ch = 16;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 &&
+        ws.ws_xpixel > 0 && ws.ws_ypixel > 0 && ws.ws_col > 0 && ws.ws_row > 0) {
+        int a = ws.ws_xpixel / ws.ws_col, b = ws.ws_ypixel / ws.ws_row;
+        if (a > 0 && b > 0) { *cw = a; *ch = b; }
+    }
+}
+/* Rasterize one page to `out` (a PNG). Returns 0 on success. */
+static int pdf_raster(const char *pdf, int page1, int W, int H,
+                      double pt_w, const char *out) {
+    char sw[32], sh[32], sp[32], sr[32], first[48], last[48], dev[64], sout[PATH_MAX + 16];
+    char *argv[16];
+    int n = 0;
+    snprintf(sw, sizeof sw, "%d", W);
+    snprintf(sh, sizeof sh, "%d", H);
+    snprintf(sp, sizeof sp, "%d", page1);
+    switch (rast_find()) {
+        case RAST_MUTOOL:
+            argv[n++] = rast_path; argv[n++] = (char *)"draw";
+            argv[n++] = (char *)"-q";
+            argv[n++] = (char *)"-F"; argv[n++] = (char *)"png";
+            argv[n++] = (char *)"-o"; argv[n++] = (char *)out;
+            argv[n++] = (char *)"-w"; argv[n++] = sw;
+            argv[n++] = (char *)"-h"; argv[n++] = sh;
+            argv[n++] = (char *)pdf; argv[n++] = sp;
+            break;
+        case RAST_PDFTOPPM: {
+            /* pdftoppm appends ".png" to the prefix it is given */
+            size_t l = strlen(out);
+            snprintf(sout, sizeof sout, "%.*s", (int)(l > 4 ? l - 4 : l), out);
+            argv[n++] = rast_path; argv[n++] = (char *)"-png";
+            argv[n++] = (char *)"-f"; argv[n++] = sp;
+            argv[n++] = (char *)"-l"; argv[n++] = sp;
+            argv[n++] = (char *)"-singlefile";
+            argv[n++] = (char *)"-scale-to-x"; argv[n++] = sw;
+            argv[n++] = (char *)"-scale-to-y"; argv[n++] = sh;
+            argv[n++] = (char *)pdf; argv[n++] = sout;
+            break;
+        }
+        case RAST_GS:
+            snprintf(sr, sizeof sr, "-r%d", pt_w > 1 ? (int)(W * 72.0 / pt_w + 0.5) : 96);
+            snprintf(first, sizeof first, "-dFirstPage=%d", page1);
+            snprintf(last, sizeof last, "-dLastPage=%d", page1);
+            snprintf(dev, sizeof dev, "-sDEVICE=png16m");
+            snprintf(sout, sizeof sout, "-sOutputFile=%s", out);
+            argv[n++] = rast_path; argv[n++] = (char *)"-q";
+            argv[n++] = (char *)"-dNOPAUSE"; argv[n++] = (char *)"-dBATCH";
+            argv[n++] = (char *)"-dSAFER"; argv[n++] = dev;
+            argv[n++] = sr; argv[n++] = first; argv[n++] = last;
+            argv[n++] = sout; argv[n++] = (char *)pdf;
+            break;
+        default: return -1;
+    }
+    argv[n] = NULL;
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) {
+            dup2(devnull, STDIN_FILENO);
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            if (devnull > 2) close(devnull);
+        }
+        execv(argv[0], argv);
+        _exit(127);
+    }
+    int st = 0;
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) { }
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) return -1;
+    struct stat sb;
+    if (stat(out, &sb) != 0 || sb.st_size == 0) return -1;
+    return 0;
+}
+/* ── kitty graphics protocol ──────────────────────────────────────── */
+static const char B64[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static void kitty_delete(int id) {
+    printf("\033_Ga=d,d=i,i=%d\033\\", id);
+}
+/* Transmit a PNG and place it at the cursor, scaled into cols x rows cells.
+ * The data goes inline in 4KB base64 chunks, which every implementation of
+ * the protocol accepts (file transmission is not universally supported). */
+static int kitty_place(const char *png, int id, int y, int x, int cols, int rows) {
+    int cw, chh;
+    cell_px(&cw, &chh);
+    FILE *f = fopen(png, "rb");
+    if (!f) return -1;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return -1; }
+    long sz = ftell(f);
+    if (sz <= 0 || sz > (64L << 20)) { fclose(f); return -1; }
+    rewind(f);
+    unsigned char *raw = xmalloc((size_t)sz);
+    if (fread(raw, 1, (size_t)sz, f) != (size_t)sz) { free(raw); fclose(f); return -1; }
+    fclose(f);
+
+    size_t b64n = ((size_t)sz + 2) / 3 * 4;
+    char *b64 = xmalloc(b64n + 4);
+    size_t o = 0;
+    for (long i = 0; i < sz; i += 3) {
+        unsigned v = (unsigned)raw[i] << 16;
+        int rem = (int)(sz - i);
+        if (rem > 1) v |= (unsigned)raw[i + 1] << 8;
+        if (rem > 2) v |= raw[i + 2];
+        b64[o++] = B64[(v >> 18) & 63];
+        b64[o++] = B64[(v >> 12) & 63];
+        b64[o++] = rem > 1 ? B64[(v >> 6) & 63] : '=';
+        b64[o++] = rem > 2 ? B64[v & 63] : '=';
+    }
+    /* Scale to the image's own footprint, not the pane's: passing the pane
+     * box would stretch a portrait page to fill it. PNG keeps width and
+     * height at a fixed offset in the IHDR chunk. */
+    if (sz > 24 && memcmp(raw, "\x89PNG\r\n\x1a\n", 8) == 0) {
+        unsigned iw = ((unsigned)raw[16] << 24) | ((unsigned)raw[17] << 16) |
+                      ((unsigned)raw[18] << 8) | raw[19];
+        unsigned ih = ((unsigned)raw[20] << 24) | ((unsigned)raw[21] << 16) |
+                      ((unsigned)raw[22] << 8) | raw[23];
+        if (iw && ih && iw < (1u << 20) && ih < (1u << 20)) {
+            int ci = (int)((iw + (unsigned)cw - 1) / (unsigned)cw);
+            int ri = (int)((ih + (unsigned)chh - 1) / (unsigned)chh);
+            if (ci > cols || ri > rows) {          /* shrink, keeping the ratio */
+                double s = 1.0;
+                if (ci > cols) s = (double)cols / ci;
+                if (ri > rows && (double)rows / ri < s) s = (double)rows / ri;
+                ci = max2(1, (int)(ci * s));
+                ri = max2(1, (int)(ri * s));
+            }
+            x += (cols - ci) / 2;                  /* centre it in the pane */
+            cols = max2(1, ci);
+            rows = max2(1, ri);
+        }
+    }
+    free(raw);
+
+    printf("\033[%d;%dH", y + 1, x + 1);          /* cursor to the pane corner */
+    const size_t CH = 4096;
+    for (size_t p = 0; p < o; p += CH) {
+        size_t n = min2((int)CH, (int)(o - p));
+        int more = (p + n < o);
+        if (p == 0)
+            printf("\033_Gf=100,a=T,q=2,i=%d,c=%d,r=%d,m=%d;",
+                   id, cols, rows, more);
+        else
+            printf("\033_Gm=%d;", more);
+        fwrite(b64 + p, 1, n, stdout);
+        fputs("\033\\", stdout);
+    }
+    free(b64);
+    return 0;
+}
+/* What each pane wants on screen this frame; emitted after ncurses refreshes,
+ * because the escapes must not be overwritten by a curses update. */
+#define GFX_ID_BASE 7100
+static struct {
+    int  want;
+    int  y, x, cols, rows;
+    char sig[PATH_MAX + 64];
+    char png[PATH_MAX];
+} gfx[MAX_PANES];
+static char gfx_sig_live[MAX_PANES][PATH_MAX + 64];
+
+static void gfx_reset_frame(void) {
+    for (int i = 0; i < MAX_PANES; i++) gfx[i].want = 0;
+}
+/* Rasterize if needed and remember where this pane's image goes. */
+static void gfx_request(int pane, Buf *b, int y, int x, int cols, int rows) {
+    if (pane < 0 || pane >= MAX_PANES || cols < 2 || rows < 2) return;
+    int cw, chh;
+    cell_px(&cw, &chh);
+    int W = cols * cw, H = rows * chh;
+    if (W < 16 || H < 16) return;
+    char sig[PATH_MAX + 64];
+    snprintf(sig, sizeof sig, "%s|%d|%dx%d", b->path, b->pdf->page, W, H);
+    gfx[pane].want = 1;
+    gfx[pane].y = y; gfx[pane].x = x;
+    gfx[pane].cols = cols; gfx[pane].rows = rows;
+    snprintf(gfx[pane].sig, sizeof gfx[pane].sig, "%s", sig);
+
+    if (strcmp(sig, gfx_sig_live[pane]) == 0) return;      /* already placed */
+    char tmp[PATH_MAX];
+    const char *dir = getenv("XDG_RUNTIME_DIR");
+    if (!dir || !*dir) dir = "/tmp";
+    snprintf(tmp, sizeof tmp, "%s/sds-%d-%d.png", dir, (int)getpid(), pane);
+    double pt_w = 612;
+    if (b->pdf->npg > 0) {
+        PdfPage *g = &b->pdf->pg[b->pdf->page];
+        if (g->mb[2] - g->mb[0] > 1) pt_w = g->mb[2] - g->mb[0];
+    }
+    if (pdf_raster(b->path, b->pdf->page + 1, W, H, pt_w, tmp) != 0) {
+        gfx[pane].want = 0;
+        b->pdf_img = 0;                       /* fall back to text next frame */
+        set_msg("could not render this page — showing text%s", "");
+        return;
+    }
+    snprintf(gfx[pane].png, sizeof gfx[pane].png, "%s", tmp);
+}
+/* Emit the frame's images. Placements that did not change are left alone so
+ * paging through a document does not re-transmit the same picture. */
+static void gfx_flush(void) {
+    int any = 0;
+    for (int i = 0; i < MAX_PANES; i++) {
+        int id = GFX_ID_BASE + i;
+        if (!gfx[i].want) {
+            if (gfx_sig_live[i][0]) { kitty_delete(id); gfx_sig_live[i][0] = 0; any = 1; }
+            continue;
+        }
+        if (strcmp(gfx[i].sig, gfx_sig_live[i]) == 0) continue;
+        kitty_delete(id);
+        if (kitty_place(gfx[i].png, id, gfx[i].y, gfx[i].x,
+                        gfx[i].cols, gfx[i].rows) == 0)
+            snprintf(gfx_sig_live[i], sizeof gfx_sig_live[i], "%s", gfx[i].sig);
+        else
+            gfx_sig_live[i][0] = 0;
+        unlink(gfx[i].png);
+        any = 1;
+    }
+    if (any) fflush(stdout);
+}
+static void gfx_clear_all(void) {
+    for (int i = 0; i < MAX_PANES; i++)
+        if (gfx_sig_live[i][0]) { kitty_delete(GFX_ID_BASE + i); gfx_sig_live[i][0] = 0; }
+    fflush(stdout);
+}
+
 /* ── panes ────────────────────────────────────────────────────────── */
 /* 1 pane fills the area; 2 split left/right; 3 keeps the left column whole
  * and stacks the right one; 4 is a 2×2. Dividers are carved out of the area
@@ -4462,7 +4939,7 @@ static void pane_focus_dir(int dir) {
 /* Where the focused pane wants the hardware cursor; -1 means "hide it". */
 static int g_cy = -1, g_cx = -1;
 
-static void draw_pane(Rect pr, int ti, int focused, int hdr) {
+static void draw_pane(Rect pr, int pi, int ti, int focused, int hdr) {
     if (pr.h < 1 || pr.w < 1 || ti < 0 || ti >= ntabs) return;
     Buf *b = tabs[ti];
     if (hdr) {
@@ -4504,6 +4981,13 @@ static void draw_pane(Rect pr, int ti, int focused, int hdr) {
      * point (rx == tw) still lands on screen instead of past the edge */
     if (wrap && tw > 1) tw--;
     g_wtw = tw;
+    /* a PDF page is re-flowed to whatever width the pane ended up with, so it
+     * never needs sideways scrolling */
+    if (b->kind == TAB_PDF && b->pdf->laid_w != tw) pdf_relayout(b, tw);
+    if (b->kind == TAB_PDF && b->pdf_img) {
+        gfx_request(pi, b, y0, x0, ew, rows);
+        if (b->pdf_img) return;            /* cleared again if rendering failed */
+    }
     int rx = rx_of(&b->ln[b->cy], b->cx);
 
     if (!wrap) {
@@ -4588,11 +5072,11 @@ static void draw_editor(int h, int w) {
     int focus = min2(curpane, L.n - 1);
     int hdr = L.n > 1;
     if (L.n == 1) {                       /* too cramped to split, or single */
-        draw_pane(a, cur, 1, 0);
+        draw_pane(a, curpane, cur, 1, 0);
     } else {
         for (int i = 0; i < L.n; i++)
-            if (i != focus) draw_pane(L.r[i], panes[i], 0, hdr);
-        draw_pane(L.r[focus], panes[focus], 1, hdr);
+            if (i != focus) draw_pane(L.r[i], i, panes[i], 0, hdr);
+        draw_pane(L.r[focus], focus, panes[focus], 1, hdr);
     }
     attron(COLOR_PAIR(CP_MUTED));
     if (L.vx >= 0)
@@ -4623,8 +5107,9 @@ static void draw_status(int h, int w) {
     } else if (cur >= 0 && tabs[cur]->kind == TAB_PDF) {
         Buf *b = tabs[cur];
         Pdf *p = b->pdf;
-        snprintf(left, sizeof left, " %s   PDF   page %d/%d   Left/Right = page",
-                 b->path, p->npg ? p->page + 1 : 0, p->npg);
+        snprintf(left, sizeof left, " %s   PDF   page %d/%d   Left/Right = page"
+                 "   v = %s", b->path, p->npg ? p->page + 1 : 0, p->npg,
+                 b->pdf_img ? "text" : "page image");
     } else if (cur >= 0) {
         Buf *b = tabs[cur];
         char br[160] = "";
@@ -4672,7 +5157,7 @@ static void draw_help(int h, int w) {
       "   Alt+Shift+N again closes one)   Ctrl+G   go to page             ",
       "                                   Ctrl+F   search this page       ",
       "  FIND & GO                        Ctrl+C   copy selection         ",
-      "  Ctrl+F  find (Enter=next)                                        ",
+      "  Ctrl+F  find (Enter=next)        v        page image / text      ",
       "  F3      find next                TERMINAL                        ",
       "  Ctrl+R  replace (y/n/a/q)        Alt+T    new terminal tab       ",
       "  Ctrl+G  go to line               Shift+PgUp/PgDn   scrollback    ",
@@ -4700,17 +5185,22 @@ static void draw_help(int h, int w) {
 }
 static void draw(void) {
     int h = LINES, w = COLS;
+    gfx_reset_frame();
     erase();
     draw_tabbar(w);
     draw_tree(h);
-    draw_status(h, w);
+    /* editor first: it can raise a message (a page that would not render),
+     * and the status bar is what shows it */
     draw_editor(h, w);
+    draw_status(h, w);
     if (show_help) draw_help(h, w);
     int wantcur = cur >= 0 && !show_help && g_cy >= 0 &&
                   tabs[cur]->kind != TAB_PDF;
     if (wantcur) move(g_cy, g_cx);
     curs_set(wantcur ? 1 : 0);
     refresh();
+    if (show_help) gfx_reset_frame();     /* the help box owns the screen */
+    gfx_flush();
 }
 
 /* ── confirm dialog ───────────────────────────────────────────────── */
@@ -6237,6 +6727,17 @@ int main(int argc, char **argv) {
                 }
                 continue;
             }
+            if (c == 'v') {                          /* page image <-> text */
+                if (b->pdf_img) {
+                    b->pdf_img = 0;
+                    set_msg("showing extracted text — v for the page image%s", "");
+                } else {
+                    const char *why = pdf_render_why_not();
+                    if (why) set_msg("%s", why);
+                    else { b->pdf_img = 1; set_msg("showing the page — v for text%s", ""); }
+                }
+                continue;
+            }
             if (c == kb[KB_FIND])      { do_find();   continue; }
             if (c == kb[KB_FIND_NEXT]) { find_next(); continue; }
             switch (c) {
@@ -6345,6 +6846,7 @@ int main(int argc, char **argv) {
         }
     }
 done:
+    gfx_clear_all();            /* do not leave images behind in the terminal */
     tc_restore();               /* leave the terminal's palette as we found it */
     refresh();
     printf("\033[?2004l");
