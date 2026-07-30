@@ -90,6 +90,13 @@ static int tree_hidden = 0;        /* sidebar currently folded away */
 enum { D_UP, D_DOWN, D_LEFT, D_RIGHT, D_HOME, D_END };
 enum { K_PSTART = 2900, K_PEND, K_ADEL, K_AINS, K_NONE };
 #define ALT(c)  (3000 + (c))
+/* Alt+Shift+<digit>. A terminal cannot say "shift and the 2 key" — it sends
+ * whatever that combination types, and which character that is depends on the
+ * keyboard layout: Shift+2 is @ on a US board but " on a Swedish one. So the
+ * shifted digit row is decoded through the active layout rather than assumed,
+ * and these codes stand for the digit itself. */
+#define PKEY(d) (3600 + (d))
+#define IS_PKEY(c) ((c) >= PKEY(0) && (c) <= PKEY(9))
 #undef  CTRL                      /* sys/ttydefaults.h (via pty.h) defines it */
 #define CTRL(c) ((c) & 0x1f)
 
@@ -2322,15 +2329,6 @@ static void pane_show_tab(int t) {
     else panes[curpane] = t;
     cur = panes[curpane];
 }
-/* A terminal cannot send "Shift+3" — it sends '#'. Undo that so Alt+Shift+N
- * can address the tab numbers printed in the tab bar. Returns 0-9, or -1. */
-static int shift_digit(int c) {
-    static const char sh[] = ")!@#$%^&*(";
-    int ch = c - 3000;                             /* the ALT() offset */
-    if (ch <= 0 || ch > 255) return -1;
-    const char *p = strchr(sh, ch);
-    return p ? (int)(p - sh) : -1;
-}
 
 /* ── file tree ────────────────────────────────────────────────────── */
 static Node *node_new(const char *name, const char *path, int is_dir, Node *parent) {
@@ -3220,9 +3218,87 @@ static const struct { const char *name; int dflt; } kb_def[] = {
     { "move_line_up",  MK(6, D_UP)       }, { "move_line_down", MK(6, D_DOWN)  },
     { "pane_left",     MK(4, D_LEFT)     }, { "pane_right",  MK(4, D_RIGHT)    },
     { "pane_up",       MK(4, D_UP)       }, { "pane_down",   MK(4, D_DOWN)     },
-    { "pane_close",    ALT(')')          },
+    { "pane_close",    PKEY(0)           },
 };
 static int kb[KB_N];
+
+/* Shifted digit rows, indexed by digit: entry 0 is Shift+0. Written as UTF-8
+ * because several layouts put a non-ASCII character on one of the digits. */
+static const struct { const char *name, *row; } kb_rows[] = {
+    { "us",      ")!@#$%^&*("  },
+    { "uk",      ")!\"\u00a3$%^&*(" },
+    { "nordic",  "=!\"#\u00a4%&/()" },
+    { "german",  "=!\"\u00a7$%&/()" },
+    { "spanish", "=!\"\u00b7$%&/()" },
+    { "italian", "=!\"\u00a3$%&/()" },
+    { "french",  "0123456789"  },
+};
+#define NKBROW ((int)(sizeof kb_rows / sizeof *kb_rows))
+static const char *kb_row = NULL;       /* active row, resolved on first use */
+static char kb_row_cfg[64] = "";        /* [keys] shifted_digits, if set */
+
+static const char *kb_row_by_name(const char *n) {
+    for (int i = 0; i < NKBROW; i++)
+        if (!strcasecmp(kb_rows[i].name, n)) return kb_rows[i].row;
+    return NULL;
+}
+/* xkb layout code → the row it types. */
+static const char *kb_row_for_layout(const char *l) {
+    static const struct { const char *l, *r; } m[] = {
+        { "se", "nordic" }, { "fi", "nordic" }, { "no", "nordic" },
+        { "nb", "nordic" }, { "dk", "nordic" }, { "da", "nordic" },
+        { "is", "nordic" }, { "de", "german" }, { "at", "german" },
+        { "ch", "german" }, { "gb", "uk"     }, { "es", "spanish" },
+        { "it", "italian" }, { "fr", "french" }, { "be", "french" },
+    };
+    for (size_t i = 0; i < sizeof m / sizeof *m; i++)
+        if (!strncasecmp(l, m[i].l, 2)) return kb_row_by_name(m[i].r);
+    return NULL;
+}
+static int kb_probe(const char *cmd, const char *key, char *out, size_t cap) {
+    FILE *f = popen(cmd, "r");
+    if (!f) return 0;
+    char line[256];
+    int got = 0;
+    size_t kl = strlen(key);
+    while (!got && fgets(line, sizeof line, f)) {
+        char *p = strstr(line, key);
+        if (!p) continue;
+        p += kl;
+        while (*p == ' ' || *p == '\t' || *p == ':') p++;
+        size_t n = strcspn(p, ",\r\n \t");        /* first of a comma list */
+        if (n && n < cap) { snprintf(out, cap, "%.*s", (int)n, p); got = 1; }
+    }
+    pclose(f);
+    return got;
+}
+/* Resolved lazily: nothing pays for this until an Alt+<symbol> key is hit. */
+static const char *kb_digits(void) {
+    if (kb_row) return kb_row;
+    if (kb_row_cfg[0]) {
+        const char *r = kb_row_by_name(kb_row_cfg);
+        if (r) return kb_row = r;
+        if (strcasecmp(kb_row_cfg, "auto") != 0) return kb_row = kb_row_cfg;
+    }
+    char lay[64] = "";
+    const char *env = getenv("XKB_DEFAULT_LAYOUT");
+    if (env && *env) snprintf(lay, sizeof lay, "%.*s", (int)strcspn(env, ","), env);
+    if (!lay[0]) kb_probe("setxkbmap -query 2>/dev/null", "layout", lay, sizeof lay);
+    if (!lay[0]) kb_probe("localectl status 2>/dev/null", "X11 Layout", lay, sizeof lay);
+    const char *r = lay[0] ? kb_row_for_layout(lay) : NULL;
+    return kb_row = (r ? r : kb_rows[0].row);
+}
+/* Is this UTF-8 character on the shifted digit row? Returns the digit or -1. */
+static int kb_digit_of(const char *ch, int len) {
+    const char *row = kb_digits();
+    for (int d = 0, i = 0; d < 10 && row[i]; d++) {
+        int n = 1;
+        while (row[i + n] && ((unsigned char)row[i + n] & 0xc0) == 0x80) n++;
+        if (n == len && memcmp(row + i, ch, (size_t)len) == 0) return d;
+        i += n;
+    }
+    return -1;
+}
 
 /* "ctrl+shift+left", "alt+q", "f5", "escape" … → an sds key code, or -1 */
 static int parse_key(const char *s) {
@@ -3281,10 +3357,10 @@ static int parse_key(const char *s) {
     if (!strcmp(k, "pageup"))   return KEY_PPAGE;
     if (!strcmp(k, "pagedown")) return KEY_NPAGE;
     if (k[1]) return -1;                          /* multi-char, unrecognised */
-    /* A terminal has no way to say "shift+3": it just sends '#'. Spell the
-     * shifted digits out so "alt+shift+3" in the config means what it looks
-     * like, which is what the pane bindings are written as. */
-    if (shift && isdigit((unsigned char)k[0])) k[0] = ")!@#$%^&*("[k[0] - '0'];
+    /* "alt+shift+3" means the 3 key, whatever character that types on this
+     * keyboard; the reader resolves it through the layout. */
+    if (shift && alt && !ctrl && isdigit((unsigned char)k[0]))
+        return PKEY(k[0] - '0');
     if (ctrl) return CTRL(k[0]);
     if (alt)  return ALT(k[0]);
     return (unsigned char)k[0];
@@ -3458,6 +3534,14 @@ static const char *DEFAULT_CONFIG =
 "pane_up       = \"alt+shift+up\"\n"
 "pane_down     = \"alt+shift+down\"\n"
 "pane_close    = \"alt+shift+0\"\n"
+"\n"
+"# Which characters your keyboard types for Shift+0..Shift+9. A terminal\n"
+"# never reports \"shift and the 2 key\", only the character it produces, and\n"
+"# that differs per layout (Shift+2 is @ on a US board, \" on a Swedish one).\n"
+"# \"auto\" reads the active X keyboard layout. You can also name a layout —\n"
+"# us, uk, nordic, german, spanish, italian, french — or spell the row out,\n"
+"# ten characters starting with Shift+0, e.g. \"=!\\\"#\u00a4%&/()\".\n"
+"shifted_digits = \"auto\"\n"
 "\n"
 "# Moving lines lived on Alt+Shift+Up/Down before the panes took those over.\n"
 "move_line_up   = \"ctrl+shift+up\"\n"
@@ -3652,6 +3736,10 @@ static void cfg_load(void) {
                         tree_autohide = atoi(v);
                     }
                 } else if (!strcmp(sect, "keys")) {
+                    if (!strcmp(k, "shifted_digits")) {
+                        snprintf(kb_row_cfg, sizeof kb_row_cfg, "%s", v);
+                        continue;
+                    }
                     for (int i = 0; i < KB_N; i++)
                         if (!strcmp(k, kb_def[i].name)) {
                             int c = parse_key(v);
@@ -5547,7 +5635,26 @@ static int read_key_raw(void) {
     }
     else if (c2 == '[' || c2 == 'O') r = csi_tail(0);   /* undecoded plain key */
     else if (c2 == '\r' || c2 == '\n' || c2 == KEY_ENTER) r = ALT('\n');
-    else r = ALT(tolower(c2));
+    else {
+        /* Alt+<char>. Collect the whole UTF-8 character first: several
+         * layouts put a non-ASCII symbol on a shifted digit. */
+        char ch[8];
+        int n = 0;
+        ch[n++] = (char)c2;
+        if ((c2 & 0x80) && c2 != ERR) {
+            int need = (c2 & 0xe0) == 0xc0 ? 1 : (c2 & 0xf0) == 0xe0 ? 2 :
+                       (c2 & 0xf8) == 0xf0 ? 3 : 0;
+            for (int i = 0; i < need; i++) {
+                int cc = getch();
+                if (cc == ERR || (cc & 0xc0) != 0x80) break;
+                ch[n++] = (char)cc;
+            }
+        }
+        int d = kb_digit_of(ch, n);
+        if (d >= 0)      r = PKEY(d);
+        else if (n == 1) r = ALT(tolower(c2));
+        else             r = K_NONE;          /* Alt + some other letter */
+    }
     timeout(g_timeout);            /* not nodelay(FALSE): that forces blocking */
     return r;
 }
@@ -6629,7 +6736,7 @@ int main(int argc, char **argv) {
                        c == kb[KB_TREE_EXPAND] ||
                        c == kb[KB_PANE_LEFT] || c == kb[KB_PANE_RIGHT] ||
                        c == kb[KB_PANE_UP] || c == kb[KB_PANE_DOWN] ||
-                       c == kb[KB_PANE_CLOSE] || shift_digit(c) >= 0 ||
+                       c == kb[KB_PANE_CLOSE] || IS_PKEY(c) ||
                        (c >= ALT('1') && c <= ALT('9')));
             if (!app) {
                 if (t && !t->dead) term_key(t, c);
@@ -6670,13 +6777,13 @@ int main(int argc, char **argv) {
         if (c == kb[KB_PANE_UP])    { pane_focus_dir(D_UP);    continue; }
         if (c == kb[KB_PANE_DOWN])  { pane_focus_dir(D_DOWN);  continue; }
         if (c == kb[KB_PANE_CLOSE]) { pane_close();            continue; }
-        {
-            int d = shift_digit(c);              /* Alt+Shift+1..9 → pane N */
+        if (IS_PKEY(c)) {                        /* Alt+Shift+1..9 → pane N */
+            int d = c - PKEY(0);
             if (d >= 1 && d <= 9) {
                 if (d - 1 < ntabs) pane_show_tab(d - 1);
                 else set_msg("that tab is not open%s", "");
-                continue;
             }
+            continue;
         }
         if (c == kb[KB_TERM])            { open_terminal();             continue; }
         if (c == kb[KB_CLOSE_TAB])       { act_close();                 continue; }
