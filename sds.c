@@ -14,8 +14,9 @@
  *   - incremental find, replace, go-to-line
  *   - fuzzy quick-open (Ctrl+P), word-based autocomplete (Ctrl+Space)
  *   - auto-indent, bracket auto-close/skip/match-highlight
- *   - line ops: move, duplicate, delete, toggle comment, block (de)indent
+ *   - line ops: move, duplicate, cut, toggle comment, block (de)indent
  *   - bracketed paste, run-a-shell-command
+ *   - mouse: click tabs, tree and text, drag to select, wheel to scroll
  *   - read-only PDF viewer: the rendered page where the terminal can show
  *     images, extracted text everywhere else (v switches), sized to fill the
  *     pane's width, with +/- zoom and arrow-key scrolling
@@ -42,7 +43,8 @@
  * Known simplifications: editing is byte-based, so while the cursor will
  * not split a multi-byte character, wide (CJK) glyphs still count as one
  * column and can shift the rendering of a line; no multi-cursor; no LSP.
- * The terminal does not implement mouse reporting or sixel graphics.
+ * sds itself takes the mouse, but programs running inside a terminal tab
+ * cannot: that emulator implements neither mouse reporting nor sixel.
  */
 
 #define _XOPEN_SOURCE 700
@@ -64,6 +66,7 @@
 #include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 #include <zlib.h>
 #ifdef SDS_TREESITTER
@@ -91,7 +94,7 @@ static int tree_hidden = 0;        /* sidebar currently folded away */
  * dir: 0=Up 1=Down 2=Left 3=Right 4=Home 5=End.                       */
 #define MK(mod, dir) (2000 + (mod) * 10 + (dir))
 enum { D_UP, D_DOWN, D_LEFT, D_RIGHT, D_HOME, D_END };
-enum { K_PSTART = 2900, K_PEND, K_ADEL, K_AINS, K_NONE };
+enum { K_PSTART = 2900, K_PEND, K_ADEL, K_AINS, K_ASENTER, K_MOUSE, K_NONE };
 #define ALT(c)  (3000 + (c))
 /* Alt+Shift+<digit>. A terminal cannot say "shift and the 2 key" — it sends
  * whatever that combination types, and which character that is depends on the
@@ -102,6 +105,42 @@ enum { K_PSTART = 2900, K_PEND, K_ADEL, K_AINS, K_NONE };
 #define IS_PKEY(c) ((c) >= PKEY(0) && (c) <= PKEY(9))
 #undef  CTRL                      /* sys/ttydefaults.h (via pty.h) defines it */
 #define CTRL(c) ((c) & 0x1f)
+
+/* ── mouse ────────────────────────────────────────────────────────────
+ * Reports arrive as CSI < btn ; col ; row M (press or drag) / m (release).
+ * That SGR form is worth asking for over the original one, which cannot
+ * name a column past 223 — on a wide terminal the right-hand pane would
+ * simply be unclickable. read_key_raw() returns K_MOUSE and leaves the
+ * event here, so the rest of the app keeps its one-int-per-key input. */
+enum { MB_LEFT, MB_MID, MB_RIGHT, MB_NONE,
+       MB_WHEEL_UP, MB_WHEEL_DOWN, MB_WHEEL_LEFT, MB_WHEEL_RIGHT };
+typedef struct { int y, x, btn, press, motion, shift, alt, ctrl; } Mouse;
+static Mouse mev;
+static int mouse_cfg = 1;          /* top-level `mouse = off` turns it off */
+
+static void mouse_enable(int on) {
+    if (!mouse_cfg) return;
+    /* 1000 = press/release, 1002 = also report motion while a button is
+     * down (drag-to-select), 1006 = SGR coordinates. */
+    printf(on ? "\033[?1000h\033[?1002h\033[?1006h"
+              : "\033[?1006l\033[?1002l\033[?1000l");
+}
+/* Hold Shift and the terminal keeps the mouse for itself, so the user can
+ * still select and copy text out of sds the way they always could. */
+static int mouse_decode(int cb, int col, int row, int press) {
+    /* Turned off in the config: swallow anything that arrives anyway rather
+     * than act on it — another program may have left reporting switched on. */
+    if (!mouse_cfg) return K_NONE;
+    mev.y = row - 1;
+    mev.x = col - 1;
+    mev.shift  = (cb & 4)  != 0;
+    mev.alt    = (cb & 8)  != 0;
+    mev.ctrl   = (cb & 16) != 0;
+    mev.motion = (cb & 32) != 0;
+    mev.btn    = (cb & 64) ? MB_WHEEL_UP + (cb & 3) : (cb & 3);
+    mev.press  = press;
+    return K_MOUSE;
+}
 
 /* ── languages ────────────────────────────────────────────────────── */
 enum { HA_DEF, HA_KW, HA_TYPE, HA_STR, HA_COM, HA_NUM, HA_PRE };
@@ -2514,6 +2553,28 @@ static void tree_open_selected(void) {
         tree_rebuild();
     } else open_file(n->path);
 }
+/* Alt+Shift+Enter: open the selected file beside whatever is already on
+ * screen instead of on top of it. Directories have no pane meaning, so they
+ * just expand as usual. */
+static void tree_open_pane_selected(void) {
+    if (nvis == 0) return;
+    Node *n = vis[tsel];
+    if (n->is_dir) { tree_open_selected(); return; }
+    for (int i = 0; i < ntabs; i++)         /* already in a pane → go there */
+        if (tabs[i]->kind != TAB_TERM && strcmp(tabs[i]->path, n->path) == 0)
+            for (int p = 0; p < npanes; p++)
+                if (panes[p] == i) { curpane = p; cur = i; return; }
+    if (cur < 0) { open_file(n->path); return; }   /* nothing open, no split */
+    if (npanes >= MAX_PANES) { set_msg("all panes are in use", NULL); return; }
+    /* Split first, then open into the new pane: open_file() sets the focused
+     * pane, and the focused pane must not be the one we are splitting from. */
+    int from = panes[curpane];
+    panes[npanes] = from;
+    curpane = npanes++;
+    cur = from;
+    open_file(n->path);
+    if (panes[curpane] == from) pane_close();      /* it failed — undo the split */
+}
 static void tree_toggle(void) {
     tree_hidden = !tree_hidden;
     set_msg(tree_hidden ? "sidebar hidden" : "sidebar shown", NULL);
@@ -3270,8 +3331,8 @@ static void apply_theme(void) {
 enum { KB_QUIT, KB_SAVE, KB_CLOSE_TAB, KB_HELP, KB_RUN, KB_TERM, KB_FIND,
        KB_FIND_NEXT, KB_REPLACE, KB_GOTO, KB_QUICKOPEN, KB_COMPLETE,
        KB_NEW_ENTRY, KB_DEL_ENTRY, KB_REFRESH, KB_TREE_UP, KB_TREE_DOWN,
-       KB_TREE_COLLAPSE, KB_TREE_EXPAND, KB_TREE_OPEN, KB_TAB_PREV,
-       KB_TAB_NEXT, KB_WRAP, KB_SIDEBAR, KB_MOVE_UP, KB_MOVE_DOWN,
+       KB_TREE_COLLAPSE, KB_TREE_EXPAND, KB_TREE_OPEN, KB_TREE_OPEN_PANE,
+       KB_TAB_PREV, KB_TAB_NEXT, KB_WRAP, KB_SIDEBAR, KB_MOVE_UP, KB_MOVE_DOWN,
        KB_PANE_LEFT, KB_PANE_RIGHT, KB_PANE_UP, KB_PANE_DOWN, KB_PANE_CLOSE,
        KB_N };
 
@@ -3286,6 +3347,7 @@ static const struct { const char *name; int dflt; } kb_def[] = {
     { "refresh",       KEY_F(5)          }, { "tree_up",     MK(3, D_UP)       },
     { "tree_down",     MK(3, D_DOWN)     }, { "tree_collapse", MK(3, D_LEFT)   },
     { "tree_expand",   MK(3, D_RIGHT)    }, { "tree_open",   ALT('\n')         },
+    { "tree_open_pane", K_ASENTER        },
     { "tab_prev",      ALT(',')          }, { "tab_next",    ALT('.')          },
     { "wrap",          ALT('z')          }, { "sidebar",     ALT('b')          },
     { "move_line_up",  MK(6, D_UP)       }, { "move_line_down", MK(6, D_DOWN)  },
@@ -3423,7 +3485,7 @@ static int parse_key(const char *s) {
     if (!strcmp(k, "insert")) return alt ? K_AINS : KEY_IC;
     if (!strcmp(k, "delete")) return alt ? K_ADEL : KEY_DC;
     if (!strcmp(k, "enter") || !strcmp(k, "return"))
-        return alt ? ALT('\n') : '\r';
+        return alt ? (shift ? K_ASENTER : ALT('\n')) : '\r';
     if (!strcmp(k, "escape") || !strcmp(k, "esc")) return alt ? ALT(27) : 27;
     if (!strcmp(k, "space"))  return ctrl ? 0 : (alt ? ALT(' ') : ' ');
     if (!strcmp(k, "tab"))    return '\t';
@@ -3550,6 +3612,12 @@ static const char *DEFAULT_CONFIG =
 "# exit. Set to off if colors inside terminal tabs look wrong.\n"
 "true_color = on\n"
 "\n"
+"# Click tabs, the tree and the text; drag to select; wheel to scroll. While\n"
+"# this is on the terminal hands pointer events to sds instead of acting on\n"
+"# them itself — hold Shift to get the terminal's own select-and-copy back,\n"
+"# or set this to off if you would rather never give it up.\n"
+"mouse = on\n"
+"\n"
 "[editor]\n"
 "tab_width = 4        # render width of a tab character (1-16)\n"
 "soft_wrap = false    # start with word wrap on (toggle at runtime with Alt+Z)\n"
@@ -3598,6 +3666,11 @@ static const char *DEFAULT_CONFIG =
 "tree_collapse = \"alt+left\"\n"
 "tree_expand   = \"alt+right\"\n"
 "tree_open     = \"alt+enter\"\n"
+"# Opens the selected file in a pane of its own, next to the one you are in.\n"
+"# Needs a terminal that can report Shift with Enter (sds asks for xterm's\n"
+"# modifyOtherKeys at startup); where it can't, this arrives as plain\n"
+"# Alt+Enter and opens in the current pane instead.\n"
+"tree_open_pane = \"alt+shift+enter\"\n"
 "tab_prev      = \"alt+,\"\n"
 "tab_next      = \"alt+.\"\n"
 "wrap          = \"alt+z\"\n"
@@ -3794,6 +3867,9 @@ static void cfg_load(void) {
                 } else if (!sect[0] && !strcmp(k, "true_color")) {
                     tc_want = !(!strcmp(v, "false") || !strcmp(v, "off") ||
                                 !strcmp(v, "0"));
+                } else if (!sect[0] && !strcmp(k, "mouse")) {
+                    mouse_cfg = !(!strcmp(v, "false") || !strcmp(v, "off") ||
+                                  !strcmp(v, "0"));
                 } else if (!strcmp(sect, "editor")) {
                     if (!strcmp(k, "tab_width")) {
                         int n = atoi(v);
@@ -4131,7 +4207,12 @@ static void term_csi(Term *t, char f) {
             t->wrapnext = 0;
             break;
         case 'J':
-            if (p0 == 0) {
+            /* ED 3 drops the scrollback and leaves the screen alone. `clear`
+             * sends it right after the 2J, and without it everything it just
+             * "cleared" is still there a Shift+PgUp away. */
+            if (p0 == 3) {
+                t->sb_n = t->sb_head = t->sb_view = 0;
+            } else if (p0 == 0) {
                 term_clear_row(t, t->cy, t->cx, t->cols - 1);
                 for (int y = t->cy + 1; y < t->rows; y++) term_clear_row(t, y, 0, t->cols - 1);
             } else if (p0 == 1) {
@@ -4175,7 +4256,9 @@ static void term_csi(Term *t, char f) {
             if (t->top >= t->bot) { t->top = 0; t->bot = t->rows - 1; }
             t->cy = t->top; t->cx = 0;
             break;
-        case 'm': term_sgr(t); break;
+        /* CSI > 4 ; n m sets modifyOtherKeys; it is not SGR, and reading it as
+         * one would turn the rest of the output bold and underlined. */
+        case 'm': if (!t->priv) term_sgr(t); break;
         case 's': t->scy = t->cy; t->scx = t->cx; break;
         case 'u': t->cy = t->scy; t->cx = t->scx; break;
         case 'h': case 'l':
@@ -4562,7 +4645,13 @@ static int draw_row(Buf *b, int scr_y, int scr_x, int li, int tw, int maxrows,
     return used ? used : 1;
 }
 
+/* Where each tab ended up on the bar, so a click can be matched against the
+ * same boxes that were drawn rather than against a second guess at the
+ * layout. x0 < 0 means the tab scrolled off the bar. */
+static struct { int x0, x1; } tab_box[MAX_TABS];
+
 static void draw_tabbar(int w) {
+    for (int i = 0; i < MAX_TABS; i++) tab_box[i].x0 = tab_box[i].x1 = -1;
     move(0, 0);
     attron(COLOR_PAIR(CP_TAB));
     for (int i = 0; i < w; i++) addch(' ');
@@ -4600,6 +4689,8 @@ static void draw_tabbar(int w) {
         attron(COLOR_PAIR(pair) | extra);
         mvaddnstr(0, x, t, w - x);
         attroff(COLOR_PAIR(pair) | extra);
+        tab_box[i].x0 = x;
+        tab_box[i].x1 = min2(x + (int)strlen(t), w);
         x += (int)strlen(t);
         if (x < w) {
             attron(COLOR_PAIR(CP_MUTED)); mvaddstr(0, x, "|");
@@ -5162,6 +5253,68 @@ static void pane_focus_dir(int dir) {
 /* Where the focused pane wants the hardware cursor; -1 means "hide it". */
 static int g_cy = -1, g_cx = -1;
 
+/* The layout the last frame was drawn with, for hit-testing clicks. n == 0
+ * means nothing is open and there is nothing to click into. */
+static Layout g_lay;
+static int    g_lay_hdr;
+
+/* A pane's text area: its rectangle less the header row the split view adds. */
+static Rect pane_body(int i) {
+    Rect r = g_lay.r[i];
+    if (g_lay_hdr) { r.y++; r.h--; }
+    return r;
+}
+/* Columns a pane spends on line numbers, and the text width left over.
+ * draw_pane works this out the same way; both have to agree or a click
+ * lands on the wrong character. */
+static int pane_gutter(Buf *b) {
+    if (b->kind == TAB_PDF) return 1;
+    int gut = 1;
+    for (int n = b->n; n; n /= 10) gut++;
+    if (gut < 4) gut = 4;
+    if (gut > 10) gut = 10;
+    return gut;
+}
+static int pane_textw(Buf *b, int panew) {
+    int tw = panew - pane_gutter(b) - 1;
+    if (tw < 1) tw = 1;
+    /* when wrapping, leave one column free so a cursor sitting at the wrap
+     * point (rx == tw) still lands on screen instead of past the edge */
+    if (wrap && tw > 1) tw--;
+    return tw;
+}
+/* Text rows the focused pane shows, for the keys that scroll by a viewport. */
+static int focused_pane_rows(void) {
+    if (g_lay.n < 1) return LINES - 2;
+    return pane_body(min2(curpane, g_lay.n - 1)).h;
+}
+/* Scroll a buffer's viewport by n rows. The cursor comes along only as far
+ * as it has to: draw_pane pulls the offsets back to the cursor every frame,
+ * so a viewport that left it behind would snap straight back. */
+static void ed_scroll(Buf *b, int down, int n, int rows) {
+    for (int k = 0; k < n; k++) {
+        if (down) {
+            if (wrap) {
+                if (++b->subrow >= line_rows(b, b->rowoff, g_wtw)) {
+                    b->subrow = 0;
+                    if (b->rowoff < b->n - 1) b->rowoff++;
+                }
+            } else if (b->rowoff < b->n - 1) b->rowoff++;
+            if (b->cy < b->rowoff) b->cy++;
+        } else {
+            if (wrap) {
+                if (b->subrow > 0) b->subrow--;
+                else if (b->rowoff > 0) {
+                    b->rowoff--;
+                    b->subrow = line_rows(b, b->rowoff, g_wtw) - 1;
+                }
+            } else if (b->rowoff > 0) b->rowoff--;
+            if (rows > 1 && b->cy >= b->rowoff + rows) b->cy--;
+        }
+    }
+    if (b->cx > b->ln[b->cy].len) b->cx = b->ln[b->cy].len;
+}
+
 static void draw_pane(Rect pr, int pi, int ti, int focused, int hdr) {
     if (pr.h < 1 || pr.w < 1 || ti < 0 || ti >= ntabs) return;
     Buf *b = tabs[ti];
@@ -5190,19 +5343,12 @@ static void draw_pane(Rect pr, int pi, int ti, int focused, int hdr) {
         if (focused) getyx(stdscr, g_cy, g_cx);
         return;
     }
-    /* line numbers make no sense for a PDF page, so it gets a plain margin */
+    /* line numbers make no sense for a PDF page, so it gets a plain margin.
+     * The widths come from the shared helpers because a click has to be able
+     * to work out the same ones. */
     int nums = (b->kind != TAB_PDF);
-    int gut = 1;
-    if (nums) {
-        for (int n = b->n; n; n /= 10) gut++;
-        if (gut < 4) gut = 4;
-        if (gut > 10) gut = 10;
-    }
-    int tw = ew - gut - 1;
-    if (tw < 1) tw = 1;
-    /* when wrapping, leave one column free so a cursor sitting at the wrap
-     * point (rx == tw) still lands on screen instead of past the edge */
-    if (wrap && tw > 1) tw--;
+    int gut = pane_gutter(b);
+    int tw  = pane_textw(b, ew);
     g_wtw = tw;
     /* a PDF page is re-flowed to whatever width the pane ended up with, so it
      * never needs sideways scrolling */
@@ -5276,6 +5422,8 @@ static void draw_editor(int h, int w) {
     (void)h; (void)w;
     Rect a = editor_area();
     g_cy = g_cx = -1;
+    memset(&g_lay, 0, sizeof g_lay);
+    g_lay_hdr = 0;
     if (cur < 0) {
         const char *hint[] = {
             "Alt+Up/Down    browse the file tree",
@@ -5294,6 +5442,8 @@ static void draw_editor(int h, int w) {
     Layout L = pane_layout(a);
     int focus = min2(curpane, L.n - 1);
     int hdr = L.n > 1;
+    g_lay = L;
+    g_lay_hdr = hdr;
     if (L.n == 1) {                       /* too cramped to split, or single */
         draw_pane(a, curpane, cur, 1, 0);
     } else {
@@ -5359,6 +5509,7 @@ static void draw_status(int h, int w) {
     }
     attroff(COLOR_PAIR(CP_STATUS));
 }
+static int help_off = 0;        /* first help line shown, when it must scroll */
 static void draw_help(int h, int w) {
     static const char *lines[] = {
       "  sds — keybindings                                                ",
@@ -5367,12 +5518,12 @@ static void draw_help(int h, int w) {
       "  Alt+Up/Down    move in tree      Ctrl+Z / Ctrl+Y   undo / redo   ",
       "  Alt+Rt/Left    expand/collapse   Ctrl+C/X/V        copy/cut/paste",
       "  Alt+Enter      open / toggle     Ctrl+A            select all    ",
-      "  Alt+Insert     new file/folder   Ctrl+D            duplicate line",
-      "  Alt+Delete     delete file/dir   Ctrl+K            delete line   ",
-      "  F5 / Alt+E     rescan tree       Ctrl+/            toggle comment",
-      "  Alt+B          show/hide sidebar Ctrl+Shift+Up/Dn  move line     ",
-      "  (Alt+Left at top level hides it) Alt+O             new line below",
-      "                                   Tab / Shift+Tab   indent/dedent ",
+      "  Alt+Shift+Ent  open in a pane    Ctrl+D            duplicate line",
+      "  Alt+Insert     new file/folder   Ctrl+K or Ctrl+/  toggle comment",
+      "  Alt+Delete     delete file/dir   Ctrl+Shift+Up/Dn  move line     ",
+      "  F5 / Alt+E     rescan tree       Alt+O             new line below",
+      "  Alt+B          show/hide sidebar Tab / Shift+Tab   indent/dedent ",
+      "  (Alt+Left at top level hides it)                                 ",
       "  TABS & PANES                     Shift+arrows      select        ",
       "  Alt+, / Alt+.  prev / next tab   Ctrl+Left/Right   word jump     ",
       "  Alt+1..9       go to tab N       Ctrl+Home/End     file start/end",
@@ -5390,6 +5541,10 @@ static void draw_help(int h, int w) {
       "  Ctrl+G  go to line               Alt+T    new terminal tab       ",
       "  Ctrl+P  quick-open file          Shift+PgUp/PgDn   scrollback    ",
       "                                   type 'exit' to end the shell    ",
+      "  MOUSE    click tab focus · middle-click close · wheel = next tab ",
+      "  tree     click open/toggle · middle-click opens it in a pane     ",
+      "  text     click places cursor · drag selects · 2x word · 3x line  ",
+      "  wheel scrolls the pane under it · drag the sidebar edge to size  ",
       "  Esc  clear selection/highlight   APP                             ",
       "  Tree marks: M modified  ? new    Ctrl+S / Alt+S    save          ",
       "              A added    D deleted Alt+R             run command   ",
@@ -5397,7 +5552,13 @@ static void draw_help(int h, int w) {
       "  config: ~/.config/sds/config     Alt+Q             quit          ",
     };
     int n = (int)(sizeof lines / sizeof *lines);
-    int bw = (int)strlen(lines[0]) + 2, bh = n + 2;
+    /* On a short terminal the list does not fit; show a window of it and let
+     * the arrows or the wheel move that window, rather than silently losing
+     * whatever fell off the bottom. */
+    int rows = min2(n, max2(1, h - 4));
+    int maxoff = n - rows;
+    help_off = max2(0, min2(help_off, maxoff));
+    int bw = (int)strlen(lines[0]) + 2, bh = rows + 2;
     int y0 = (h - bh) / 2, x0 = (w - bw) / 2;
     if (y0 < 0) y0 = 0;
     if (x0 < 0) x0 = 0;
@@ -5406,8 +5567,17 @@ static void draw_help(int h, int w) {
         move(y0 + r, x0);
         for (int c = 0; c < bw && x0 + c < w; c++) addch(' ');
     }
-    for (int i = 0; i < n && y0 + 1 + i < h; i++)
-        mvaddnstr(y0 + 1 + i, x0 + 1, lines[i], w - x0 - 1);
+    for (int i = 0; i < rows && y0 + 1 + i < h; i++)
+        mvaddnstr(y0 + 1 + i, x0 + 1, lines[help_off + i], w - x0 - 1);
+    if (maxoff > 0) {
+        char more[64];
+        snprintf(more, sizeof more, " %d more below — Up/Down or wheel ",
+                 maxoff - help_off);
+        if (help_off >= maxoff) snprintf(more, sizeof more, " end — any key closes ");
+        attron(A_BOLD);
+        mvaddnstr(y0 + bh - 1, x0 + 1, more, w - x0 - 1);
+        attroff(A_BOLD);
+    }
     attroff(COLOR_PAIR(CP_SEL));
 }
 static void draw(void) {
@@ -5708,18 +5878,62 @@ static void tree_delete_selected(void) {
 }
 
 /* ── input ────────────────────────────────────────────────────────── */
+/* One key reported through modifyOtherKeys (CSI 27;mod;code ~) or the CSI u
+ * form: a code point plus xterm's modifier mask. Terminals only fall back on
+ * these for combinations with no legacy encoding — Shift+Enter is the one sds
+ * needs — but decode the rest too, so a terminal that reports more than it has
+ * to does not silently lose bindings. */
+static int mok_key(int code, int mod) {
+    if (mod < 1) mod = 1;
+    int shift = (mod - 1) & 1, alt = (mod - 1) & 2, ctrl = (mod - 1) & 4;
+    if (code == 13 || code == 10)
+        return alt ? (shift ? K_ASENTER : ALT('\n')) : '\r';
+    if (code == 9)   return shift ? KEY_BTAB : '\t';
+    if (code == 27)  return 27;
+    if (code == 8 || code == 127) return KEY_BACKSPACE;
+    if (code < 32 || code > 0x10ffff) return K_NONE;
+    if (ctrl && !alt) {
+        if (code == '/') return 31;             /* what the key really types */
+        return CTRL(tolower(code));
+    }
+    if (alt && !ctrl) {
+        char ch[8];
+        int n = pdf_utf8((uint32_t)code, ch);
+        int d = kb_digit_of(ch, n);             /* Alt+Shift+<digit> → pane N */
+        if (d >= 0) return PKEY(d);
+        return code < 128 ? ALT(tolower(code)) : K_NONE;
+    }
+    return (!alt && !ctrl && code < 128) ? code : K_NONE;
+}
 /* Parse the tail of a CSI sequence ncurses didn't decode itself.
  * `defmod` is the modifier to assume when the sequence carries none:
  * 3 (Alt) if we saw a doubled ESC, 0 (plain) for a bare ESC [ ... .
  * Getting this right matters: a plain Up that ncurses failed to decode
  * must stay Up, not silently become Alt+Up.                            */
 static int csi_tail(int defmod) {
-    int ch, mod = 0, num = 0, first = 0, nnum = 0, final = 0;
+    int ch, mod = 0, num = 0, first = 0, nnum = 0, final = 0, mouse = 0;
+    int p[3] = { 0, 0, 0 };                     /* the first three parameters */
     while ((ch = getch()) != ERR) {
+        if (ch == '<' && !nnum && !num) { mouse = 1; continue; }
         if (isdigit(ch)) num = num * 10 + (ch - '0');
-        else if (ch == ';') { if (!nnum) first = num; nnum++; num = 0; }
-        else { final = ch; if (nnum >= 1) mod = num; else first = num; break; }
+        else if (ch == ';') {
+            if (!nnum) first = num;
+            if (nnum < 3) p[nnum] = num;
+            nnum++; num = 0;
+        }
+        else {
+            final = ch;
+            if (nnum >= 1) mod = num; else first = num;
+            if (nnum < 3) p[nnum] = num;
+            break;
+        }
     }
+    if (mouse)                                     /* CSI < btn ; col ; row M */
+        return mouse_decode(p[0], p[1], p[2], final == 'M');
+    if (final == 'u')                              /* CSI code ; mod u */
+        return mok_key(first, nnum >= 1 ? p[1] : 1);
+    if (final == '~' && first == 27 && nnum >= 2)  /* CSI 27 ; mod ; code ~ */
+        return mok_key(p[2], p[1]);
     if (mod < 2 || mod > 8) mod = defmod;
     int alt = (mod == 3 || mod == 4);
     if (final == '~') {
@@ -5752,8 +5966,31 @@ static int csi_tail(int defmod) {
  * block, so they go through read_key() rather than read_key_raw(). */
 static int g_timeout = -1;
 
+/* The parameters of an SGR mouse report — btn ; col ; row — with the opening
+ * CSI < already eaten, closed by M (press or drag) or m (release). */
+static int mouse_tail(void) {
+    int p[3] = { 0, 0, 0 }, np = 0, num = 0, ch;
+    while ((ch = getch()) != ERR) {
+        if (isdigit(ch)) { num = num * 10 + (ch - '0'); continue; }
+        if (ch == ';') { if (np < 3) p[np] = num; np++; num = 0; continue; }
+        if (np < 3) p[np] = num;
+        if (ch != 'M' && ch != 'm') return K_NONE;
+        return mouse_decode(p[0], p[1], p[2], ch == 'M');
+    }
+    return K_NONE;
+}
 static int read_key_raw(void) {
     int c = getch();
+    /* ncurses knows the CSI < that opens an SGR report and hands back
+     * KEY_MOUSE, but it only decodes the parameters when its own mouse
+     * layer is switched on — which would fight with the raw reading here.
+     * So take the tail ourselves. */
+    if (c == KEY_MOUSE) {
+        nodelay(stdscr, TRUE);         /* a truncated report must not hang us */
+        int r = mouse_tail();
+        timeout(g_timeout);
+        return r;
+    }
     if (c == KEY_SLEFT)  return MK(2, D_LEFT);
     if (c == KEY_SRIGHT) return MK(2, D_RIGHT);
     if (c == KEY_SHOME)  return MK(2, D_HOME);
@@ -6613,6 +6850,8 @@ static void run_command(void) {
     tc_restore();                       /* the command gets the real palette */
     endwin();
     printf("\033[?2004l");
+    printf("\033[>4;0m");               /* the command gets plain key encoding */
+    mouse_enable(0);                    /* and the mouse back, for its own use */
     printf("\033[H\033[2J\033[3J");     /* clear screen + scrollback */
     if (saved) printf("[saved %d file(s)]\n", saved);
     printf("$ %s\n", in);
@@ -6631,6 +6870,8 @@ static void run_command(void) {
     reset_prog_mode();
     apply_theme();                    /* and sds takes its palette back */
     printf("\033[?2004h");
+    printf("\033[>4;1m");
+    mouse_enable(1);
     fflush(stdout);
     getch();                          /* any key, not just Enter */
 
@@ -6683,6 +6924,195 @@ static int act_quit(void) {
         return 0;
     }
     return 1;
+}
+
+/* ── mouse handling ───────────────────────────────────────────────── */
+/* Everything here hit-tests against what the last frame actually drew —
+ * tab_box and g_lay — rather than working the layout out a second time,
+ * because a second guess is a second thing to keep in step. */
+enum { DRAG_NONE, DRAG_SEL, DRAG_TREEW };
+static int  drag_mode = DRAG_NONE, drag_pane = 0;
+static long click_at = 0;                    /* double / triple click run */
+static int  click_y = -1, click_x = -1, click_n = 0;
+
+static long now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+static int pane_at(int y, int x) {
+    for (int i = 0; i < g_lay.n; i++) {
+        Rect r = g_lay.r[i];
+        if (y >= r.y && y < r.y + r.h && x >= r.x && x < r.x + r.w) return i;
+    }
+    return -1;
+}
+/* The tab drawn in laid-out pane i. When the area is too cramped to split,
+ * the single rectangle shows the focused tab whatever pane it belongs to. */
+static int lay_tab(int i) {
+    if (g_lay.n <= 1) return cur;
+    return (i >= 0 && i < npanes) ? panes[i] : -1;
+}
+static void lay_focus(int i) {
+    if (g_lay.n > 1 && i >= 0 && i < npanes) { curpane = i; cur = panes[i]; }
+}
+/* A point in a pane's text area → the position in its buffer. */
+static void pane_pos(Buf *b, Rect body, int y, int x, int *oy, int *ox) {
+    int tw  = pane_textw(b, body.w);
+    int rx  = x - (body.x + pane_gutter(b) + 1);
+    int li = b->rowoff, seg = 0;
+    if (rx < 0) rx = 0;
+    if (!wrap) {
+        li += max2(0, y - body.y);
+        rx += b->coloff;
+    } else {
+        seg = b->subrow;
+        for (int left = max2(0, y - body.y); left > 0 && li < b->n; left--) {
+            if (seg + 1 < line_rows(b, li, tw)) seg++;
+            else { li++; seg = 0; }
+        }
+        rx += seg * tw;
+    }
+    if (li >= b->n) { li = b->n - 1; rx = INT_MAX; }
+    if (li < 0) li = 0;
+    int cx = cx_of_rx(&b->ln[li], rx);
+    /* a click can land inside a multi-byte character; snap to its start */
+    while (cx > 0 && cx < b->ln[li].len && utf8_cont((unsigned char)b->ln[li].s[cx]))
+        cx--;
+    *oy = li;
+    *ox = cx;
+}
+static void select_word_at(Buf *b) {
+    Line *l = &b->ln[b->cy];
+    int i = b->cx;
+    if (i >= l->len || !word_ch(l->s[i])) {
+        if (i > 0 && word_ch(l->s[i - 1])) i--;
+        else return;                          /* nothing wordy under the click */
+    }
+    int s = i, e = i;
+    while (s > 0 && word_ch(l->s[s - 1])) s--;
+    while (e < l->len && word_ch(l->s[e])) e++;
+    b->sel = 1; b->ay = b->cy; b->ax = s; b->cx = e;
+}
+static void select_line_at(Buf *b) {
+    b->sel = 1; b->ay = b->cy; b->ax = 0;
+    if (b->cy < b->n - 1) { b->cy++; b->cx = 0; }
+    else b->cx = b->ln[b->cy].len;
+}
+static void mouse_wheel(int y, int x, int down) {
+    if (y == 0) {                             /* over the tab bar: walk tabs */
+        if (ntabs) set_cur((cur + (down ? 1 : ntabs - 1)) % ntabs);
+        return;
+    }
+    if (!tree_hidden && x <= tree_w) {
+        tsel = max2(0, min2(nvis - 1, tsel + (down ? 3 : -3)));
+        return;
+    }
+    int pi = pane_at(y, x);
+    if (pi < 0) return;
+    int ti = lay_tab(pi);
+    if (ti < 0) return;
+    Buf *b = tabs[ti];
+    if (b->kind == TAB_TERM) {
+        Term *t = b->term;
+        if (t) t->sb_view = max2(0, min2(t->sb_n, t->sb_view + (down ? -3 : 3)));
+    } else if (b->kind == TAB_PDF && b->pdf_img) {
+        int cw, chh;
+        cell_px(&cw, &chh);
+        pdf_scroll(b, (down ? 3 : -3) * chh);
+    } else {
+        ed_scroll(b, down, 3, pane_body(pi).h);
+    }
+}
+static void handle_mouse(void) {
+    int y = mev.y, x = mev.x;
+
+    /* A drag belongs to whatever the press started on, no matter where the
+     * pointer has wandered to since. */
+    if (mev.motion) {
+        if (drag_mode == DRAG_TREEW) {
+            int lim = min2(100, COLS - PANE_MINW - 2);
+            if (lim >= 10) tree_w = max2(10, min2(x, lim));
+            return;
+        }
+        if (drag_mode != DRAG_SEL || drag_pane >= g_lay.n) return;
+        int ti = lay_tab(drag_pane);
+        if (ti < 0 || tabs[ti]->kind == TAB_TERM) return;
+        Buf *b = tabs[ti];
+        Rect body = pane_body(drag_pane);
+        if (body.h < 1) return;
+        /* dragging past an edge scrolls, so a selection can run off-screen */
+        if (y < body.y)                  ed_scroll(b, 0, 1, body.h);
+        else if (y >= body.y + body.h)   ed_scroll(b, 1, 1, body.h);
+        int cy, cx;
+        pane_pos(b, body, min2(max2(y, body.y), body.y + body.h - 1), x, &cy, &cx);
+        if (!b->sel) { b->sel = 1; b->ay = b->cy; b->ax = b->cx; }
+        b->cy = cy; b->cx = cx;
+        return;
+    }
+    if (!mev.press) { drag_mode = DRAG_NONE; return; }
+    if (mev.btn == MB_WHEEL_UP || mev.btn == MB_WHEEL_DOWN) {
+        mouse_wheel(y, x, mev.btn == MB_WHEEL_DOWN);
+        return;
+    }
+    if (mev.btn > MB_RIGHT) return;           /* horizontal wheel, unused */
+
+    if (y == 0) {                             /* tab bar */
+        for (int i = 0; i < ntabs; i++)
+            if (tab_box[i].x0 >= 0 && x >= tab_box[i].x0 && x < tab_box[i].x1) {
+                if (mev.btn == MB_MID) {      /* browser habit: close it */
+                    if (i != cur) pending_close = 0;
+                    set_cur(i);
+                    act_close();
+                } else focus_tab(i);
+                return;
+            }
+        return;
+    }
+    if (y >= LINES - 1) return;               /* status bar */
+
+    if (!tree_hidden && x <= tree_w) {        /* sidebar */
+        if (mev.btn == MB_RIGHT) return;
+        if (x == tree_w) { drag_mode = DRAG_TREEW; return; }   /* its edge */
+        int i = toff + (y - 1);
+        if (i < 0 || i >= nvis) return;
+        tsel = i;
+        Node *n = vis[i];
+        if (n->is_dir) {
+            n->expanded = !n->expanded;
+            if (n->expanded) node_load(n);
+            tree_rebuild();
+        }
+        else if (mev.btn == MB_MID) tree_open_pane_selected();
+        else if (mev.btn == MB_LEFT) open_file(n->path);
+        return;
+    }
+
+    int pi = pane_at(y, x);
+    if (pi < 0) return;
+    lay_focus(pi);
+    if (g_lay_hdr && y == g_lay.r[pi].y) return;   /* the header only focuses */
+    int ti = lay_tab(pi);
+    if (ti < 0 || mev.btn != MB_LEFT) return;
+    Buf *b = tabs[ti];
+    /* a terminal or a rendered page has no text cursor to place */
+    if (b->kind == TAB_TERM || (b->kind == TAB_PDF && b->pdf_img)) return;
+
+    Rect body = pane_body(pi);
+    if (body.h < 1) return;
+    int cy, cx;
+    pane_pos(b, body, y, x, &cy, &cx);
+
+    long t = now_ms();
+    if (t - click_at < 400 && y == click_y && x == click_x) click_n++;
+    else click_n = 1;
+    click_at = t; click_y = y; click_x = x;
+
+    if (mev.shift && b->sel) { b->cy = cy; b->cx = cx; return; }   /* extend */
+    b->cy = cy; b->cx = cx; b->sel = 0;
+    if (click_n == 2)      select_word_at(b);
+    else if (click_n >= 3) select_line_at(b);
+    else { drag_mode = DRAG_SEL; drag_pane = pi; }
 }
 
 /* ── main ─────────────────────────────────────────────────────────── */
@@ -6825,6 +7255,12 @@ int main(int argc, char **argv) {
         define_key("\033[201~", K_PEND);
     }
     printf("\033[?2004h");                       /* bracketed paste on */
+    /* Ask for xterm's modifyOtherKeys level 1: keys that already have a
+     * legacy encoding keep it, and only the ambiguous ones — Shift+Enter,
+     * which sds binds — arrive as CSI 27;mod;code~. Terminals that don't
+     * know the sequence ignore it. */
+    printf("\033[>4;1m");
+    mouse_enable(1);
     fflush(stdout);
 
     if (has_colors()) {
@@ -6853,7 +7289,21 @@ int main(int argc, char **argv) {
         if (pump_all_terms()) need_draw = 1;
         need_draw = 1;
         if (c == K_NONE || c == KEY_RESIZE) continue;
-        if (show_help) { show_help = 0; continue; }
+        if (show_help) {                  /* any key closes it, but scroll first */
+            int wheel = (c == K_MOUSE && mev.press) ? mev.btn : -1;
+            if (c == KEY_UP)             { help_off--;     continue; }
+            if (c == KEY_DOWN)           { help_off++;     continue; }
+            if (wheel == MB_WHEEL_UP)    { help_off -= 3;  continue; }
+            if (wheel == MB_WHEEL_DOWN)  { help_off += 3;  continue; }
+            if (c == KEY_PPAGE)          { help_off -= 5;  continue; }
+            if (c == KEY_NPAGE)          { help_off += 5;  continue; }
+            if (c == K_MOUSE && (mev.motion || !mev.press)) continue;
+            show_help = 0;
+            continue;
+        }
+        /* before the terminal branch below: a click has to be able to reach
+         * the tree and the tab bar even while a shell holds the keyboard */
+        if (c == K_MOUSE) { handle_mouse(); continue; }
 
         /* a focused terminal swallows everything except the app-level keys */
         if (cur >= 0 && tabs[cur]->kind == TAB_TERM) {
@@ -6871,7 +7321,8 @@ int main(int argc, char **argv) {
                        c == kb[KB_TAB_PREV] || c == kb[KB_TAB_NEXT] ||
                        c == kb[KB_SIDEBAR] || c == kb[KB_QUICKOPEN] ||
                        c == kb[KB_TREE_UP] || c == kb[KB_TREE_DOWN] ||
-                       c == kb[KB_TREE_OPEN] || c == kb[KB_TREE_COLLAPSE] ||
+                       c == kb[KB_TREE_OPEN] || c == kb[KB_TREE_OPEN_PANE] ||
+                       c == kb[KB_TREE_COLLAPSE] ||
                        c == kb[KB_TREE_EXPAND] ||
                        c == kb[KB_PANE_LEFT] || c == kb[KB_PANE_RIGHT] ||
                        c == kb[KB_PANE_UP] || c == kb[KB_PANE_DOWN] ||
@@ -6897,6 +7348,7 @@ int main(int argc, char **argv) {
         if (c == kb[KB_TREE_DOWN])       { if (tsel < nvis - 1) tsel++; continue; }
         if (c == kb[KB_TREE_COLLAPSE])   { tree_collapse();             continue; }
         if (c == kb[KB_TREE_EXPAND])     { tree_expand();               continue; }
+        if (c == kb[KB_TREE_OPEN_PANE])  { tree_open_pane_selected();   continue; }
         if (c == kb[KB_TREE_OPEN])       { tree_open_selected();        continue; }
         if (c == kb[KB_DEL_ENTRY])       { tree_delete_selected();      continue; }
         if (c == kb[KB_NEW_ENTRY])       { tree_new_entry();            continue; }
@@ -6927,7 +7379,7 @@ int main(int argc, char **argv) {
         if (c == kb[KB_TERM])            { open_terminal();             continue; }
         if (c == kb[KB_CLOSE_TAB])       { act_close();                 continue; }
         if (c == kb[KB_SAVE] || c == ALT('s')) { act_save();            continue; }
-        if (c == kb[KB_HELP])            { show_help = 1;               continue; }
+        if (c == kb[KB_HELP])   { show_help = 1; help_off = 0;          continue; }
         if (c == kb[KB_RUN])             { run_command();               continue; }
         if (c == kb[KB_QUIT])            { if (act_quit()) goto done;   continue; }
         if (c == kb[KB_QUICKOPEN])       { do_quickopen();              continue; }
@@ -7082,23 +7534,10 @@ int main(int argc, char **argv) {
             case MK(6, D_HOME):  move_cursor(b, M_DOCHOME, 1); break;
             case MK(6, D_END):   move_cursor(b, M_DOCEND, 1);  break;
             case MK(5, D_UP):                       /* scroll viewport */
-                if (wrap) {
-                    if (b->subrow > 0) b->subrow--;
-                    else if (b->rowoff > 0) {
-                        b->rowoff--;
-                        b->subrow = line_rows(b, b->rowoff, g_wtw) - 1;
-                    }
-                } else if (b->rowoff > 0) b->rowoff--;
-                if (b->cy >= b->rowoff + LINES - 2) b->cy--;
+                ed_scroll(b, 0, 1, focused_pane_rows());
                 break;
             case MK(5, D_DOWN):
-                if (wrap) {
-                    if (++b->subrow >= line_rows(b, b->rowoff, g_wtw)) {
-                        b->subrow = 0;
-                        if (b->rowoff < b->n - 1) b->rowoff++;
-                    }
-                } else if (b->rowoff < b->n - 1) b->rowoff++;
-                if (b->cy < b->rowoff) b->cy++;
+                ed_scroll(b, 1, 1, focused_pane_rows());
                 break;
             /* editing */
             case '\r': case '\n': case KEY_ENTER: ed_enter(b);     break;
@@ -7119,8 +7558,9 @@ int main(int argc, char **argv) {
                 b->cy = b->n - 1; b->cx = b->ln[b->cy].len;
                 break;
             case CTRL('d'):                       ed_dup_line(b);  break;
-            case CTRL('k'):                       ed_del_line(b);  break;
-            case 31: /* Ctrl+/ */                 ed_toggle_comment(b); break;
+            /* Ctrl+/ is the one every editor agrees on, but plenty of layouts
+             * make it awkward to reach, so Ctrl+K does the same thing. */
+            case CTRL('k'): case 31: /* Ctrl+/ */ ed_toggle_comment(b); break;
             case ALT('o'):                        ed_open_below(b); break;
             case 27:
                 b->sel = 0; find_show = 0;
@@ -7134,6 +7574,8 @@ done:
     tc_restore();               /* leave the terminal's palette as we found it */
     refresh();
     printf("\033[?2004l");
+    printf("\033[>4;0m");       /* and hand the key encoding back as we found it */
+    mouse_enable(0);
     fflush(stdout);
     endwin();
     return 0;
