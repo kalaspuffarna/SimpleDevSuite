@@ -16,6 +16,9 @@
  *   - auto-indent, bracket auto-close/skip/match-highlight
  *   - line ops: move, duplicate, delete, toggle comment, block (de)indent
  *   - bracketed paste, run-a-shell-command
+ *   - read-only PDF viewer: the rendered page where the terminal can show
+ *     images, extracted text everywhere else (v switches), sized to fill the
+ *     pane's width, with +/- zoom and arrow-key scrolling
  *
  * The mod key is Alt for app-level things; editing chords follow VS Code
  * where the terminal allows (see Alt+H in the app for the full list).
@@ -361,6 +364,7 @@ static int npanes = 1, curpane = 0;
 
 /* PDF page rendering (see the graphics section further down) */
 static int cfg_pdf_render = 1;          /* config [pdf] render */
+static double cfg_pdf_zoom = 1.0;       /* config [pdf] zoom, 100 = fit width */
 static const char *pdf_render_why_not(void);   /* NULL when a page can be shown */
 
 static Node *root = NULL;
@@ -765,7 +769,19 @@ struct Pdf {
      * the pane is, so the fragments are kept and only re-flowed on a resize. */
     PdfOut   out;
     int      laid_w;               /* width b->ln was last laid out for */
+    /* Page-image view. zoom is relative to "page width fills the pane", so a
+     * half-width pane stays as readable as a full-width one and a resize
+     * keeps the same apparent size. sx/sy scroll inside the rendered page,
+     * and the image and view sizes below are what the last frame actually put
+     * on screen, which is what the scroll keys work against. */
+    double   zoom;
+    int      sx, sy;               /* scroll into the page image, in pixels */
+    int      img_w, img_h;         /* size of the page image last rendered */
+    int      view_w, view_h;       /* pane size in pixels it was rendered for */
 };
+
+#define PDF_ZOOM_MIN 0.25
+#define PDF_ZOOM_MAX 8.0
 
 /* ── lexing ───────────────────────────────────────────────────────── */
 static int pdf_ws(int c) {
@@ -2186,6 +2202,7 @@ static void pdf_relayout(Buf *b, int width) {
 static void pdf_page_into(Buf *b, int page) {
     Pdf *pdf = b->pdf;
     b->cy = b->cx = b->rowoff = b->coloff = b->subrow = 0;
+    pdf->sx = pdf->sy = 0;                  /* a new page starts at its top */
     if (page < 0) page = 0;
     if (page >= pdf->npg) page = pdf->npg - 1;
     pdf->page = page;
@@ -2204,6 +2221,61 @@ static void pdf_page_into(Buf *b, int page) {
     }
     pdf_relayout(b, pdf->laid_w);
 }
+/* ── page-image view: scrolling and zoom ──────────────────────────────
+ * All of these work in image pixels and only ever move the viewport; the
+ * renderer clamps them against the page it actually produced. */
+#define PDF_SCROLL_BOTTOM (1 << 28)     /* "as far down as this page goes" */
+
+/* Scroll by dy pixels, rolling onto the next or previous page at the ends —
+ * reading a document straight through shouldn't need the page keys too. */
+static void pdf_scroll(Buf *b, int dy) {
+    Pdf *p = b->pdf;
+    int maxy = max2(0, p->img_h - p->view_h);
+    int ny = p->sy + dy;
+    if (ny > maxy) {
+        if (p->sy < maxy) { p->sy = maxy; return; }
+        if (p->page + 1 >= p->npg) { set_msg("last page%s", ""); return; }
+        pdf_page_into(b, p->page + 1);
+    } else if (ny < 0) {
+        if (p->sy > 0) { p->sy = 0; return; }
+        if (p->page <= 0) { set_msg("first page%s", ""); return; }
+        pdf_page_into(b, p->page - 1);
+        p->sy = PDF_SCROLL_BOTTOM;
+    } else {
+        p->sy = ny;
+    }
+}
+static void pdf_pan(Buf *b, int dx) {
+    Pdf *p = b->pdf;
+    p->sx = max2(0, min2(p->sx + dx, max2(0, p->img_w - p->view_w)));
+}
+/* Zoom about the middle of the viewport, so whatever is being read stays on
+ * screen instead of sliding out of it. */
+static void pdf_set_zoom(Buf *b, double z) {
+    Pdf *p = b->pdf;
+    if (z < PDF_ZOOM_MIN) z = PDF_ZOOM_MIN;
+    if (z > PDF_ZOOM_MAX) z = PDF_ZOOM_MAX;
+    if (z == p->zoom) return;
+    double s = z / p->zoom;
+    p->zoom = z;
+    if (p->img_w > 0) {
+        p->sx = max2(0, (int)((p->sx + p->view_w / 2.0) * s - p->view_w / 2.0));
+        p->sy = max2(0, (int)((p->sy + p->view_h / 2.0) * s - p->view_h / 2.0));
+    }
+    char pct[32];
+    snprintf(pct, sizeof pct, "%d%%", (int)(z * 100 + 0.5));
+    set_msg("zoom %s", pct);
+}
+/* Shrink until the whole page is inside the pane; the reverse of the default,
+ * which fills the pane's width and scrolls. */
+static void pdf_fit_page(Buf *b) {
+    Pdf *p = b->pdf;
+    if (p->img_w <= 0 || p->img_h <= 0) return;
+    double s = (double)p->view_w / p->img_w;
+    if ((double)p->view_h / p->img_h < s) s = (double)p->view_h / p->img_h;
+    p->sx = p->sy = 0;
+    pdf_set_zoom(b, p->zoom * s);
+}
 static Buf *pdf_load(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
@@ -2221,6 +2293,7 @@ static Buf *pdf_load(const char *path) {
     if (!pdf) { free(raw); return NULL; }
     pdf->raw = raw;
     pdf->rawlen = got;
+    pdf->zoom = cfg_pdf_zoom;          /* 1.0 = page width fills the pane */
     for (size_t i = 0; i + 8 <= got; i++)
         if (raw[i] == '/' && !memcmp(raw + i, "/Encrypt", 8)) { pdf->encrypted = 1; break; }
     pdf_index(pdf);
@@ -3487,6 +3560,10 @@ static const char *DEFAULT_CONFIG =
 "# one of mutool, pdftoppm or gs is installed. Falls back to text with a\n"
 "# message when either is missing. `v` toggles the two at runtime.\n"
 "render = on\n"
+"# How large a page starts out, as a percentage of the pane's width: 100 fills\n"
+"# the pane edge to edge and scrolls with Up/Down, which stays readable in a\n"
+"# half-width pane. +/- change it while reading, 0 comes back here. (25-800)\n"
+"zoom = 100\n"
 "\n"
 "[tree]\n"
 "width = 30           # sidebar width in columns\n"
@@ -3728,6 +3805,11 @@ static void cfg_load(void) {
                     if (!strcmp(k, "render"))
                         cfg_pdf_render = !(!strcmp(v, "false") ||
                                            !strcmp(v, "off") || !strcmp(v, "0"));
+                    else if (!strcmp(k, "zoom")) {
+                        /* percent of the pane width a page starts at */
+                        double z = atof(v) / 100.0;
+                        if (z >= PDF_ZOOM_MIN && z <= PDF_ZOOM_MAX) cfg_pdf_zoom = z;
+                    }
                 } else if (!strcmp(sect, "tree")) {
                     if (!strcmp(k, "width")) {
                         int n = atoi(v);
@@ -4726,14 +4808,14 @@ static void cell_px(int *cw, int *ch) {
         if (a > 0 && b > 0) { *cw = a; *ch = b; }
     }
 }
-/* Rasterize one page to `out` (a PNG). Returns 0 on success. */
-static int pdf_raster(const char *pdf, int page1, int W, int H,
+/* Rasterize one page to `out` (a PNG) `W` pixels wide; the height follows
+ * from the page's own aspect ratio. Returns 0 on success. */
+static int pdf_raster(const char *pdf, int page1, int W,
                       double pt_w, const char *out) {
-    char sw[32], sh[32], sp[32], sr[32], first[48], last[48], dev[64], sout[PATH_MAX + 16];
+    char sw[32], sp[32], sr[32], first[48], last[48], dev[64], sout[PATH_MAX + 16];
     char *argv[16];
     int n = 0;
     snprintf(sw, sizeof sw, "%d", W);
-    snprintf(sh, sizeof sh, "%d", H);
     snprintf(sp, sizeof sp, "%d", page1);
     switch (rast_find()) {
         case RAST_MUTOOL:
@@ -4742,7 +4824,6 @@ static int pdf_raster(const char *pdf, int page1, int W, int H,
             argv[n++] = (char *)"-F"; argv[n++] = (char *)"png";
             argv[n++] = (char *)"-o"; argv[n++] = (char *)out;
             argv[n++] = (char *)"-w"; argv[n++] = sw;
-            argv[n++] = (char *)"-h"; argv[n++] = sh;
             argv[n++] = (char *)pdf; argv[n++] = sp;
             break;
         case RAST_PDFTOPPM: {
@@ -4754,7 +4835,7 @@ static int pdf_raster(const char *pdf, int page1, int W, int H,
             argv[n++] = (char *)"-l"; argv[n++] = sp;
             argv[n++] = (char *)"-singlefile";
             argv[n++] = (char *)"-scale-to-x"; argv[n++] = sw;
-            argv[n++] = (char *)"-scale-to-y"; argv[n++] = sh;
+            argv[n++] = (char *)"-scale-to-y"; argv[n++] = (char *)"-1";
             argv[n++] = (char *)pdf; argv[n++] = sout;
             break;
         }
@@ -4797,15 +4878,36 @@ static int pdf_raster(const char *pdf, int page1, int W, int H,
 static const char B64[] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-static void kitty_delete(int id) {
-    printf("\033_Ga=d,d=i,i=%d\033\\", id);
+static void kitty_delete(int id) {                  /* image and its data */
+    printf("\033_Ga=d,d=I,i=%d\033\\", id);
 }
-/* Transmit a PNG and place it at the cursor, scaled into cols x rows cells.
- * The data goes inline in 4KB base64 chunks, which every implementation of
- * the protocol accepts (file transmission is not universally supported). */
-static int kitty_place(const char *png, int id, int y, int x, int cols, int rows) {
-    int cw, chh;
-    cell_px(&cw, &chh);
+static void kitty_unplace(int id) {                 /* keep the data cached */
+    printf("\033_Ga=d,d=i,i=%d,p=1\033\\", id);
+}
+/* Width and height out of a PNG's IHDR chunk, which sits at a fixed offset.
+ * Returns 0 on success. */
+static int png_size(const char *path, int *w, int *h) {
+    unsigned char hd[24];
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    size_t got = fread(hd, 1, sizeof hd, f);
+    fclose(f);
+    if (got != sizeof hd || memcmp(hd, "\x89PNG\r\n\x1a\n", 8) != 0) return -1;
+    unsigned iw = ((unsigned)hd[16] << 24) | ((unsigned)hd[17] << 16) |
+                  ((unsigned)hd[18] << 8) | hd[19];
+    unsigned ih = ((unsigned)hd[20] << 24) | ((unsigned)hd[21] << 16) |
+                  ((unsigned)hd[22] << 8) | hd[23];
+    if (!iw || !ih || iw >= (1u << 20) || ih >= (1u << 20)) return -1;
+    *w = (int)iw;
+    *h = (int)ih;
+    return 0;
+}
+/* Transmit a PNG as image `id` without displaying it: the page is rendered
+ * larger than the pane, and scrolling only re-places the crop rather than
+ * pushing the whole picture down the wire again. The data goes inline in 4KB
+ * base64 chunks, which every implementation of the protocol accepts (file
+ * transmission is not universally supported). */
+static int kitty_transmit(const char *png, int id) {
     FILE *f = fopen(png, "rb");
     if (!f) return -1;
     if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return -1; }
@@ -4829,118 +4931,151 @@ static int kitty_place(const char *png, int id, int y, int x, int cols, int rows
         b64[o++] = rem > 1 ? B64[(v >> 6) & 63] : '=';
         b64[o++] = rem > 2 ? B64[v & 63] : '=';
     }
-    /* Scale to the image's own footprint, not the pane's: passing the pane
-     * box would stretch a portrait page to fill it. PNG keeps width and
-     * height at a fixed offset in the IHDR chunk. */
-    if (sz > 24 && memcmp(raw, "\x89PNG\r\n\x1a\n", 8) == 0) {
-        unsigned iw = ((unsigned)raw[16] << 24) | ((unsigned)raw[17] << 16) |
-                      ((unsigned)raw[18] << 8) | raw[19];
-        unsigned ih = ((unsigned)raw[20] << 24) | ((unsigned)raw[21] << 16) |
-                      ((unsigned)raw[22] << 8) | raw[23];
-        if (iw && ih && iw < (1u << 20) && ih < (1u << 20)) {
-            int ci = (int)((iw + (unsigned)cw - 1) / (unsigned)cw);
-            int ri = (int)((ih + (unsigned)chh - 1) / (unsigned)chh);
-            if (ci > cols || ri > rows) {          /* shrink, keeping the ratio */
-                double s = 1.0;
-                if (ci > cols) s = (double)cols / ci;
-                if (ri > rows && (double)rows / ri < s) s = (double)rows / ri;
-                ci = max2(1, (int)(ci * s));
-                ri = max2(1, (int)(ri * s));
-            }
-            x += (cols - ci) / 2;                  /* centre it in the pane */
-            cols = max2(1, ci);
-            rows = max2(1, ri);
-        }
-    }
     free(raw);
 
-    printf("\033[%d;%dH", y + 1, x + 1);          /* cursor to the pane corner */
     const size_t CH = 4096;
     for (size_t p = 0; p < o; p += CH) {
         size_t n = min2((int)CH, (int)(o - p));
         int more = (p + n < o);
-        if (p == 0)
-            printf("\033_Gf=100,a=T,q=2,i=%d,c=%d,r=%d,m=%d;",
-                   id, cols, rows, more);
-        else
-            printf("\033_Gm=%d;", more);
+        if (p == 0) printf("\033_Gf=100,a=t,q=2,i=%d,m=%d;", id, more);
+        else        printf("\033_Gm=%d;", more);
         fwrite(b64 + p, 1, n, stdout);
         fputs("\033\\", stdout);
     }
     free(b64);
     return 0;
 }
+/* Show the (sx,sy,sw,sh) rectangle of image `id` in a cols x rows box whose
+ * top-left cell is (y,x). The source rect is a whole number of cells wide and
+ * tall wherever the image is bigger than the pane, so nothing is rescaled. */
+static void kitty_put(int id, int y, int x, int cols, int rows,
+                      int sx, int sy, int sw, int sh) {
+    printf("\033[%d;%dH", y + 1, x + 1);          /* cursor to the pane corner */
+    printf("\033_Ga=p,q=2,i=%d,p=1,c=%d,r=%d,x=%d,y=%d,w=%d,h=%d\033\\",
+           id, cols, rows, sx, sy, sw, sh);
+}
 /* What each pane wants on screen this frame; emitted after ncurses refreshes,
  * because the escapes must not be overwritten by a curses update. */
 #define GFX_ID_BASE 7100
+#define PDF_RASTER_MAXW 6000            /* keeps a deep zoom from eating memory */
 static struct {
     int  want;
-    int  y, x, cols, rows;
-    char sig[PATH_MAX + 64];
+    int  y, x, cols, rows;              /* where the crop lands, in cells */
+    int  sx, sy, sw, sh;                /* the crop itself, in image pixels */
+    int  iw, ih;                        /* size of the rendered page */
+    char sig[PATH_MAX + 64];            /* identifies the transmitted image */
+    char place[96];                     /* identifies where it is shown */
     char png[PATH_MAX];
 } gfx[MAX_PANES];
 static char gfx_sig_live[MAX_PANES][PATH_MAX + 64];
+static char gfx_place_live[MAX_PANES][96];
 
 static void gfx_reset_frame(void) {
     for (int i = 0; i < MAX_PANES; i++) gfx[i].want = 0;
 }
-/* Rasterize if needed and remember where this pane's image goes. */
+/* Rasterize if needed and work out which part of the page this pane shows.
+ * The page is rendered `zoom` times as wide as the pane and scrolled inside,
+ * rather than squeezed in whole: a page shrunk to fit a half-width pane is
+ * too small to read, and that is the size this viewer is mostly used at. */
 static void gfx_request(int pane, Buf *b, int y, int x, int cols, int rows) {
     if (pane < 0 || pane >= MAX_PANES || cols < 2 || rows < 2) return;
     int cw, chh;
     cell_px(&cw, &chh);
     int W = cols * cw, H = rows * chh;
     if (W < 16 || H < 16) return;
+    Pdf *p = b->pdf;
+    if (!(p->zoom >= PDF_ZOOM_MIN && p->zoom <= PDF_ZOOM_MAX)) p->zoom = 1.0;
+
+    int RW = (int)(W * p->zoom + 0.5);
+    RW = max2(32, min2(PDF_RASTER_MAXW, RW));
     char sig[PATH_MAX + 64];
-    snprintf(sig, sizeof sig, "%s|%d|%dx%d", b->path, b->pdf->page, W, H);
+    snprintf(sig, sizeof sig, "%s|%d|w%d", b->path, p->page, RW);
     gfx[pane].want = 1;
-    gfx[pane].y = y; gfx[pane].x = x;
-    gfx[pane].cols = cols; gfx[pane].rows = rows;
     snprintf(gfx[pane].sig, sizeof gfx[pane].sig, "%s", sig);
 
-    if (strcmp(sig, gfx_sig_live[pane]) == 0) return;      /* already placed */
-    char tmp[PATH_MAX];
-    const char *dir = getenv("XDG_RUNTIME_DIR");
-    if (!dir || !*dir) dir = "/tmp";
-    snprintf(tmp, sizeof tmp, "%s/sds-%d-%d.png", dir, (int)getpid(), pane);
-    double pt_w = 612;
-    if (b->pdf->npg > 0) {
-        PdfPage *g = &b->pdf->pg[b->pdf->page];
-        if (g->mb[2] - g->mb[0] > 1) pt_w = g->mb[2] - g->mb[0];
+    if (strcmp(sig, gfx_sig_live[pane]) != 0) {            /* not on screen yet */
+        char tmp[PATH_MAX];
+        const char *dir = getenv("XDG_RUNTIME_DIR");
+        if (!dir || !*dir) dir = "/tmp";
+        snprintf(tmp, sizeof tmp, "%s/sds-%d-%d.png", dir, (int)getpid(), pane);
+        double pt_w = 612;
+        if (p->npg > 0) {
+            PdfPage *g = &p->pg[p->page];
+            if (g->mb[2] - g->mb[0] > 1) pt_w = g->mb[2] - g->mb[0];
+        }
+        if (pdf_raster(b->path, p->page + 1, RW, pt_w, tmp) != 0 ||
+            png_size(tmp, &gfx[pane].iw, &gfx[pane].ih) != 0) {
+            unlink(tmp);
+            gfx[pane].want = 0;
+            b->pdf_img = 0;                   /* fall back to text next frame */
+            set_msg("could not render this page — showing text%s", "");
+            return;
+        }
+        snprintf(gfx[pane].png, sizeof gfx[pane].png, "%s", tmp);
     }
-    if (pdf_raster(b->path, b->pdf->page + 1, W, H, pt_w, tmp) != 0) {
-        gfx[pane].want = 0;
-        b->pdf_img = 0;                       /* fall back to text next frame */
-        set_msg("could not render this page — showing text%s", "");
-        return;
-    }
-    snprintf(gfx[pane].png, sizeof gfx[pane].png, "%s", tmp);
+    int iw = gfx[pane].iw, ih = gfx[pane].ih;
+    if (iw <= 0 || ih <= 0) { gfx[pane].want = 0; return; }
+
+    /* The rendered page is the authority on how far it can scroll, so the
+     * clamp lives here rather than in the key handler. */
+    p->sx = max2(0, min2(p->sx, iw - W));
+    p->sy = max2(0, min2(p->sy, ih - H));
+    p->img_w = iw; p->img_h = ih;
+    p->view_w = W; p->view_h = H;
+
+    int sw = min2(iw, W), sh = min2(ih, H);
+    int c = max2(1, min2(cols, (sw + cw - 1) / cw));
+    int r = max2(1, min2(rows, (sh + chh - 1) / chh));
+    gfx[pane].y = y;
+    gfx[pane].x = x + (cols - c) / 2;         /* centre a page narrower than the pane */
+    gfx[pane].cols = c;  gfx[pane].rows = r;
+    gfx[pane].sx = p->sx; gfx[pane].sy = p->sy;
+    gfx[pane].sw = sw;    gfx[pane].sh = sh;
+    snprintf(gfx[pane].place, sizeof gfx[pane].place, "%d,%d,%d,%d,%d,%d,%d,%d",
+             gfx[pane].y, gfx[pane].x, c, r, p->sx, p->sy, sw, sh);
 }
-/* Emit the frame's images. Placements that did not change are left alone so
- * paging through a document does not re-transmit the same picture. */
+/* Emit the frame's images. The picture is only re-transmitted when the page
+ * or the zoom changes; scrolling just moves the crop, which is a few bytes. */
 static void gfx_flush(void) {
     int any = 0;
     for (int i = 0; i < MAX_PANES; i++) {
         int id = GFX_ID_BASE + i;
         if (!gfx[i].want) {
-            if (gfx_sig_live[i][0]) { kitty_delete(id); gfx_sig_live[i][0] = 0; any = 1; }
+            if (gfx_sig_live[i][0]) {
+                kitty_delete(id);
+                gfx_sig_live[i][0] = 0;
+                gfx_place_live[i][0] = 0;
+                any = 1;
+            }
             continue;
         }
-        if (strcmp(gfx[i].sig, gfx_sig_live[i]) == 0) continue;
-        kitty_delete(id);
-        if (kitty_place(gfx[i].png, id, gfx[i].y, gfx[i].x,
-                        gfx[i].cols, gfx[i].rows) == 0)
-            snprintf(gfx_sig_live[i], sizeof gfx_sig_live[i], "%s", gfx[i].sig);
-        else
-            gfx_sig_live[i][0] = 0;
-        unlink(gfx[i].png);
+        if (strcmp(gfx[i].sig, gfx_sig_live[i]) != 0) {
+            kitty_delete(id);
+            gfx_place_live[i][0] = 0;
+            if (kitty_transmit(gfx[i].png, id) == 0)
+                snprintf(gfx_sig_live[i], sizeof gfx_sig_live[i], "%s", gfx[i].sig);
+            else
+                gfx_sig_live[i][0] = 0;
+            unlink(gfx[i].png);
+            any = 1;
+        }
+        if (!gfx_sig_live[i][0]) continue;
+        if (strcmp(gfx[i].place, gfx_place_live[i]) == 0) continue;
+        kitty_unplace(id);
+        kitty_put(id, gfx[i].y, gfx[i].x, gfx[i].cols, gfx[i].rows,
+                  gfx[i].sx, gfx[i].sy, gfx[i].sw, gfx[i].sh);
+        snprintf(gfx_place_live[i], sizeof gfx_place_live[i], "%s", gfx[i].place);
         any = 1;
     }
     if (any) fflush(stdout);
 }
 static void gfx_clear_all(void) {
     for (int i = 0; i < MAX_PANES; i++)
-        if (gfx_sig_live[i][0]) { kitty_delete(GFX_ID_BASE + i); gfx_sig_live[i][0] = 0; }
+        if (gfx_sig_live[i][0]) {
+            kitty_delete(GFX_ID_BASE + i);
+            gfx_sig_live[i][0] = 0;
+            gfx_place_live[i][0] = 0;
+        }
     fflush(stdout);
 }
 
@@ -5195,8 +5330,12 @@ static void draw_status(int h, int w) {
     } else if (cur >= 0 && tabs[cur]->kind == TAB_PDF) {
         Buf *b = tabs[cur];
         Pdf *p = b->pdf;
-        snprintf(left, sizeof left, " %s   PDF   page %d/%d   Left/Right = page"
-                 "   v = %s", b->path, p->npg ? p->page + 1 : 0, p->npg,
+        char zoom[48] = "";
+        if (b->pdf_img)
+            snprintf(zoom, sizeof zoom, "   %d%%   +/- zoom, 0 reset",
+                     (int)(p->zoom * 100 + 0.5));
+        snprintf(left, sizeof left, " %s   PDF   page %d/%d%s   Left/Right = page"
+                 "   v = %s", b->path, p->npg ? p->page + 1 : 0, p->npg, zoom,
                  b->pdf_img ? "text" : "page image");
     } else if (cur >= 0) {
         Buf *b = tabs[cur];
@@ -5242,15 +5381,15 @@ static void draw_help(int h, int w) {
       "  Alt+Shift+arrows  focus a pane                                   ",
       "  Alt+Shift+0    close this pane   PDF (read-only)                 ",
       "  (4 panes max, in a 2x2 grid;     Left/Right, n/p, Space  page    ",
-      "   Alt+Shift+N again closes one)   Ctrl+G   go to page             ",
-      "                                   Ctrl+F   search this page       ",
-      "  FIND & GO                        Ctrl+C   copy selection         ",
-      "  Ctrl+F  find (Enter=next)        v        page image / text      ",
-      "  F3      find next                TERMINAL                        ",
-      "  Ctrl+R  replace (y/n/a/q)        Alt+T    new terminal tab       ",
-      "  Ctrl+G  go to line               Shift+PgUp/PgDn   scrollback    ",
-      "  Ctrl+P  quick-open file          type 'exit' to end the shell    ",
-      "                                                                   ",
+      "   Alt+Shift+N again closes one)   Up/Down, PgUp/PgDn  scroll      ",
+      "                                   + / -  zoom     0  reset zoom   ",
+      "  FIND & GO                        f  fit page  Shift+arrows pan   ",
+      "  Ctrl+F  find (Enter=next)        Ctrl+G  page    Ctrl+F  search  ",
+      "  F3      find next                Ctrl+C  copy    v  image/text   ",
+      "  Ctrl+R  replace (y/n/a/q)        TERMINAL                        ",
+      "  Ctrl+G  go to line               Alt+T    new terminal tab       ",
+      "  Ctrl+P  quick-open file          Shift+PgUp/PgDn   scrollback    ",
+      "                                   type 'exit' to end the shell    ",
       "  Esc  clear selection/highlight   APP                             ",
       "  Tree marks: M modified  ? new    Ctrl+S / Alt+S    save          ",
       "              A added    D deleted Alt+R             run command   ",
@@ -6843,6 +6982,44 @@ int main(int argc, char **argv) {
                     if (why) set_msg("%s", why);
                     else { b->pdf_img = 1; set_msg("showing the page — v for text%s", ""); }
                 }
+                continue;
+            }
+            /* On the page image the arrows scroll the picture instead of an
+             * invisible text cursor, and +/- resize it. Steps are in cells so
+             * they feel the same whatever the zoom. */
+            if (b->pdf_img) {
+                int cw, chh;
+                cell_px(&cw, &chh);
+                int screen = max2(chh, pf->view_h - 2 * chh);
+                switch (c) {
+                    case KEY_UP:         pdf_scroll(b, -3 * chh);  continue;
+                    case KEY_DOWN:       pdf_scroll(b,  3 * chh);  continue;
+                    case MK(2, D_UP):    pdf_scroll(b, -chh);      continue;
+                    case MK(2, D_DOWN):  pdf_scroll(b,  chh);      continue;
+                    case KEY_PPAGE:      pdf_scroll(b, -screen);   continue;
+                    case KEY_NPAGE:      pdf_scroll(b,  screen);   continue;
+                    case KEY_HOME:       pf->sy = 0;               continue;
+                    case KEY_END:        pf->sy = PDF_SCROLL_BOTTOM; continue;
+                    case MK(2, D_LEFT):  pdf_pan(b, -4 * cw);      continue;
+                    case MK(2, D_RIGHT): pdf_pan(b,  4 * cw);      continue;
+                    case MK(5, D_HOME):  pdf_page_into(b, 0);      continue;
+                    case MK(5, D_END):   pdf_page_into(b, pf->npg - 1); continue;
+                    case '+': case '=':  pdf_set_zoom(b, pf->zoom * 1.25); continue;
+                    case '-': case '_':  pdf_set_zoom(b, pf->zoom / 1.25); continue;
+                    case '0': {
+                        char pct[32];
+                        pf->sx = pf->sy = 0;
+                        pdf_set_zoom(b, cfg_pdf_zoom);
+                        snprintf(pct, sizeof pct, "%d%%",
+                                 (int)(cfg_pdf_zoom * 100 + 0.5));
+                        set_msg("default zoom — %s of the pane width", pct);
+                        continue;
+                    }
+                    case 'f': pdf_fit_page(b); continue;
+                    default: break;
+                }
+            } else if (c == '+' || c == '=' || c == '-' || c == '_' || c == 'f') {
+                set_msg("zoom applies to the page image — press v%s", "");
                 continue;
             }
             if (c == kb[KB_FIND])      { do_find();   continue; }
