@@ -5,8 +5,8 @@
  *   - file tree (left, collapsible), tab bar (top), editor with line
  *     numbers, status bar
  *   - syntax highlighting: C, C++, Python, Bash, Rust, SQL, JS/TS, Go,
- *     Java, Lua, Ruby, PHP, JSON, TOML/YAML/INI, Makefile — optionally
- *     via tree-sitter when a grammar is installed (see below)
+ *     Java, Lua, Ruby, PHP, JSON, TOML/YAML/INI, Makefile, Markdown —
+ *     optionally via tree-sitter when a grammar is installed (see below)
  *   - embedded pty terminal tabs (Alt+T) with scrollback and colors
  *   - git status markers in the tree and the branch in the status bar
  *   - config file and themes under ~/.config/sds/
@@ -20,6 +20,9 @@
  *   - read-only PDF viewer: the rendered page where the terminal can show
  *     images, extracted text everywhere else (v switches), sized to fill the
  *     pane's width, with +/- zoom and arrow-key scrolling
+ *   - markdown viewer: Alt+M swaps a .md file between its source and a
+ *     rendered view — headings, lists, tables, quotes, code — laid out for
+ *     the width of the pane it is shown in
  *
  * The mod key is Alt for app-level things; editing chords follow VS Code
  * where the terminal allows (see Alt+H in the app for the full list).
@@ -33,6 +36,7 @@
  *
  * Run:     ./sds [directory]
  *          ./sds --fetch-grammar cpp     install a tree-sitter grammar
+ *          ./sds --md-text NOTES.md 80   dump the markdown render as text
  *
  * Tree-sitter is strictly optional and loaded at runtime: grammars live in
  * ~/.local/share/sds/grammars with their highlight queries beside them in
@@ -145,7 +149,7 @@ static int mouse_decode(int cb, int col, int row, int press) {
 /* ── languages ────────────────────────────────────────────────────── */
 enum { HA_DEF, HA_KW, HA_TYPE, HA_STR, HA_COM, HA_NUM, HA_PRE };
 /* lexer states carried across lines */
-enum { ST_NORM = 0, ST_BCOM, ST_TRI1, ST_TRI2 };
+enum { ST_NORM = 0, ST_BCOM, ST_TRI1, ST_TRI2, ST_MDFENCE };
 
 typedef struct {
     const char *name;
@@ -160,6 +164,7 @@ typedef struct {
     int nocase;                /* case-insensitive keywords  */
     int sq;                    /* single quote: 0 none, 1 char-literal, 2 string */
     int bq;                    /* backtick strings           */
+    int md;                    /* markdown: own lexer, own viewer */
 } Lang;
 
 static const Lang langs[] = {
@@ -177,7 +182,7 @@ static const Lang langs[] = {
     " int_least8_t int_least16_t int_least32_t int_least64_t"
     " int_fast8_t int_fast16_t int_fast32_t int_fast64_t"
     " FILE NULL true false nullptr errno ",
-    "//", "", "/*", "*/", "", "", 0, 1, 0, 1, 0 },
+    "//", "", "/*", "*/", "", "", 0, 1, 0, 1, 0, 0 },
   { "c++", " cpp cc cxx c++ hpp hh hxx h++ ipp tpp cu cuh ",
     " if else for while do switch case default return goto break continue"
     " sizeof typedef struct union enum const static extern inline volatile"
@@ -198,7 +203,7 @@ static const Lang langs[] = {
     " pair tuple array deque list optional variant any span"
     " unique_ptr shared_ptr weak_ptr function initializer_list"
     " nullptr true false NULL ",
-    "//", "", "/*", "*/", "", "", 0, 1, 0, 1, 0 },
+    "//", "", "/*", "*/", "", "", 0, 1, 0, 1, 0, 0 },
   { "python", " py pyw ",
     " False None True and as assert async await break class continue def"
     " del elif else except finally for from global if import in is lambda"
@@ -206,14 +211,14 @@ static const Lang langs[] = {
     " print len range open str int float list dict set tuple bool bytes"
     " self super isinstance type Exception ValueError TypeError enumerate"
     " zip map filter sorted sum min max abs any all ",
-    "#", "", "", "", "'''", "\"\"\"", 1, 0, 0, 2, 0 },
+    "#", "", "", "", "'''", "\"\"\"", 1, 0, 0, 2, 0, 0 },
   { "bash", " sh bash zsh ",
     " if then else elif fi for while until do done case esac function in"
     " select time return exit break continue local export readonly"
     " declare set unset shift source alias trap ",
     " echo printf read cd pwd test true false eval exec kill wait sleep"
     " grep sed awk cat ls rm mv cp mkdir ",
-    "#", "", "", "", "", "", 0, 0, 0, 2, 1 },
+    "#", "", "", "", "", "", 0, 0, 0, 2, 1, 0 },
   { "rust", " rs ",
     " as break const continue crate dyn else enum extern fn for if impl in"
     " let loop match mod move mut pub ref return static struct super trait"
@@ -221,7 +226,7 @@ static const Lang langs[] = {
     " i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 usize isize bool"
     " char str String Vec Option Some None Result Ok Err Box self Self"
     " true false println print format vec ",
-    "//", "", "/*", "*/", "", "", 1, 0, 0, 1, 0 },
+    "//", "", "/*", "*/", "", "", 1, 0, 0, 1, 0, 0 },
   { "sql", " sql ",
     " select from where insert into values update set delete create table"
     " drop alter index view as join left right inner outer full cross on"
@@ -232,7 +237,7 @@ static const Lang langs[] = {
     " int integer bigint smallint varchar char text date time timestamp"
     " datetime boolean decimal numeric float real double blob serial"
     " count sum avg min max coalesce ifnull now ",
-    "--", "", "/*", "*/", "", "", 1, 0, 1, 2, 0 },
+    "--", "", "/*", "*/", "", "", 1, 0, 1, 2, 0, 0 },
   { "javascript", " js jsx mjs cjs ",
     " break case catch class const continue debugger default delete do"
     " else export extends finally for function if import in instanceof"
@@ -241,7 +246,7 @@ static const Lang langs[] = {
     " true false null undefined console Number String Boolean Object"
     " Array Promise Map Set Symbol JSON Math document window require"
     " module NaN Infinity ",
-    "//", "", "/*", "*/", "", "", 1, 0, 0, 2, 1 },
+    "//", "", "/*", "*/", "", "", 1, 0, 0, 2, 1, 0 },
   { "typescript", " ts tsx ",
     " break case catch class const continue debugger default delete do"
     " else export extends finally for function if import in instanceof"
@@ -251,7 +256,7 @@ static const Lang langs[] = {
     " protected keyof infer is asserts satisfies ",
     " true false null undefined any string number boolean object unknown"
     " never void console Promise Array Map Set Record Partial JSON Math ",
-    "//", "", "/*", "*/", "", "", 1, 0, 0, 2, 1 },
+    "//", "", "/*", "*/", "", "", 1, 0, 0, 2, 1, 0 },
   { "go", " go ",
     " break case chan const continue default defer else fallthrough for"
     " func go goto if import interface map package range return select"
@@ -260,7 +265,7 @@ static const Lang langs[] = {
     " int32 int64 rune string uint uint8 uint16 uint32 uint64 uintptr"
     " true false nil iota append cap close copy delete len make new panic"
     " print println recover any ",
-    "//", "", "/*", "*/", "", "", 0, 0, 0, 1, 1 },
+    "//", "", "/*", "*/", "", "", 0, 0, 0, 1, 1, 0 },
   { "java", " java ",
     " abstract assert break case catch class const continue default do"
     " else enum extends final finally for goto if implements import"
@@ -270,20 +275,20 @@ static const Lang langs[] = {
     " boolean byte char double float int long short void true false null"
     " String Object Integer Long Double Boolean List Map Set ArrayList"
     " HashMap System ",
-    "//", "", "/*", "*/", "", "", 1, 0, 0, 1, 0 },
+    "//", "", "/*", "*/", "", "", 1, 0, 0, 1, 0, 0 },
   { "lua", " lua ",
     " and break do else elseif end false for function goto if in local"
     " nil not or repeat return then true until while ",
     " print pairs ipairs table string math io os type tostring tonumber"
     " require self error pcall assert ",
-    "--", "", "--[[", "]]", "", "", 1, 0, 0, 2, 0 },
+    "--", "", "--[[", "]]", "", "", 1, 0, 0, 2, 0, 0 },
   { "ruby", " rb ",
     " alias and begin break case class def do else elsif end ensure false"
     " for if in module next nil not or redo rescue retry return self"
     " super then true undef unless until when while yield ",
     " puts print require require_relative attr_accessor attr_reader"
     " attr_writer new raise lambda proc each map select inject ",
-    "#", "", "", "", "", "", 1, 0, 0, 2, 0 },
+    "#", "", "", "", "", "", 1, 0, 0, 2, 0, 0 },
   { "php", " php ",
     " echo print if else elseif while for foreach as function return"
     " class public private protected static new try catch finally throw"
@@ -291,20 +296,22 @@ static const Lang langs[] = {
     " default break continue do const abstract final interface implements"
     " extends instanceof match fn ",
     " true false null array string int float bool void this self parent ",
-    "//", "#", "/*", "*/", "", "", 1, 0, 0, 2, 0 },
+    "//", "#", "/*", "*/", "", "", 1, 0, 0, 2, 0, 0 },
   { "json", " json ",
     " ", " true false null ",
-    "", "", "", "", "", "", 1, 0, 0, 0, 0 },
+    "", "", "", "", "", "", 1, 0, 0, 0, 0, 0 },
   { "toml", " toml ini cfg conf ",
     " ", " true false ",
-    "#", ";", "", "", "", "", 1, 0, 0, 2, 0 },
+    "#", ";", "", "", "", "", 1, 0, 0, 2, 0, 0 },
   { "yaml", " yml yaml ",
     " ", " true false null yes no ",
-    "#", "", "", "", "", "", 1, 0, 0, 2, 0 },
+    "#", "", "", "", "", "", 1, 0, 0, 2, 0, 0 },
   { "make", " mk makefile ",
     " ifeq ifneq ifdef ifndef else endif include define endef export ",
-    " ", "#", "", "", "", "", "", 0, 0, 0, 0, 0 },
-  { "text", "", " ", " ", "", "", "", "", "", "", 0, 0, 0, 0, 0 },
+    " ", "#", "", "", "", "", "", 0, 0, 0, 0, 0, 0 },
+  { "markdown", " md markdown mkd mdown mdwn ",
+    " ", " ", "", "", "", "", "", "", 1, 0, 0, 0, 0, 1 },
+  { "text", "", " ", " ", "", "", "", "", "", "", 0, 0, 0, 0, 0, 0 },
 };
 #define NLANGS ((int)(sizeof langs / sizeof *langs))
 #define LANG_TEXT (&langs[NLANGS - 1])
@@ -349,6 +356,7 @@ enum { U_INS, U_DEL };
 
 typedef struct Term Term;
 typedef struct Pdf  Pdf;
+typedef struct Md   Md;
 enum { TAB_FILE, TAB_TERM, TAB_PDF };
 
 typedef struct {
@@ -356,6 +364,9 @@ typedef struct {
     Term *term;                /* set when kind == TAB_TERM */
     Pdf  *pdf;                 /* set when kind == TAB_PDF  */
     int   pdf_img;             /* PDF tab showing the rendered page  */
+    Md   *md;                  /* rendered markdown, built on demand */
+    int   md_view;             /* showing that render instead of the text */
+    int   md_goto;             /* line to scroll the render to, -1 = none */
     char  path[PATH_MAX];
     char  name[NAME_MAX + 1];
     const Lang *lang;
@@ -405,6 +416,10 @@ static int npanes = 1, curpane = 0;
 static int cfg_pdf_render = 1;          /* config [pdf] render */
 static double cfg_pdf_zoom = 1.0;       /* config [pdf] zoom, 100 = fit width */
 static const char *pdf_render_why_not(void);   /* NULL when a page can be shown */
+
+/* Markdown preview (see the markdown section further down) */
+static int cfg_md_preview = 0;      /* config [markdown] preview: open rendered */
+static int cfg_md_width = 0;        /* config [markdown] width, 0 = the pane's */
 
 static Node *root = NULL;
 static Node **vis = NULL;
@@ -476,6 +491,7 @@ static void buf_del_line(Buf *b, int at) {
 }
 static void term_free(Term *t);
 static void pdf_free(Pdf *p);
+static void md_free(Md *m);
 static void urec_free(URec *r) { free(r->t); }
 #ifdef SDS_TREESITTER
 static void ts_forget(Buf *b);      /* drops any cached spans pointing at b */
@@ -488,6 +504,7 @@ static void buf_free(Buf *b) {
     free(b->ln);
     if (b->term) term_free(b->term);
     if (b->pdf)  pdf_free(b->pdf);
+    if (b->md)   md_free(b->md);
 #ifdef SDS_TREESITTER
     ts_forget(b);
     if (b->ts_tree)   ts_tree_delete(b->ts_tree);
@@ -2354,6 +2371,898 @@ static Buf *pdf_load(const char *path) {
     pdf_page_into(b, 0);
     return b;
 }
+/* ── markdown rendering ───────────────────────────────────────────────
+ * A .md file opens as an ordinary editable buffer; the markdown key swaps
+ * the pane over to a rendered view of it. That view is a second, read-only
+ * copy of the text — styled characters instead of markup — laid out for the
+ * width of the pane it is shown in and rebuilt whenever the buffer changes
+ * or the pane resizes.
+ *
+ * One byte of style per character: three bits of color role and five of
+ * terminal attributes, so "bold inside a link inside a quote" composes
+ * without a combinatorial table of styles. draw_md turns those bytes into
+ * curses attributes — see md_attr, next to the editor's attr_for.
+ *
+ * The parser is a pragmatic subset of CommonMark: headings (both kinds),
+ * fenced and indented code, quotes, nested lists, tables, thematic breaks,
+ * YAML front matter, and the usual inline run of emphasis, code spans and
+ * links. What it doesn't recognise it prints as plain text, which is what
+ * markdown itself does with anything it doesn't recognise.                */
+
+enum { MC_TEXT, MC_HEAD, MC_CODE, MC_LINK, MC_QUOTE, MC_META, MC_MARK, MC_RULE };
+enum { MS_BOLD = 1, MS_ITAL = 2, MS_UNDER = 4, MS_DIM = 8 };
+#define MST(c, f)     (unsigned char)(((c) << 5) | (f))
+#define MS_COL(st, c) (unsigned char)(((c) << 5) | ((st) & 31))
+#define MS_ADD(st, f) (unsigned char)((st) | (f))
+
+#define MD_MAXDEPTH 6          /* nesting the block parser will follow */
+#define MD_MAXCOL  16          /* columns a table can have */
+
+struct Md {
+    Line           *ln;        /* rendered lines */
+    unsigned char **at;        /* style byte per byte of ln[i].s */
+    int            *src;       /* buffer line each rendered line came from */
+    int             n, cap;
+    int             laid_w;    /* pane width this render was laid out for */
+    int             ver;       /* b->ver it was built from */
+    int             rowoff;    /* its own scroll position */
+};
+
+/* a stretch of styled text, built up before it is wrapped into lines */
+typedef struct { char *s; unsigned char *a; int n, cap; } MdRun;
+
+static void mr_room(MdRun *r, int need) {
+    if (r->n + need <= r->cap) return;
+    r->cap = (r->n + need) * 2 + 64;
+    r->s = xrealloc(r->s, (size_t)r->cap);
+    r->a = xrealloc(r->a, (size_t)r->cap);
+}
+static void mr_add(MdRun *r, const char *s, int n, unsigned char st) {
+    if (n <= 0) return;
+    mr_room(r, n);
+    memcpy(r->s + r->n, s, (size_t)n);
+    memset(r->a + r->n, st, (size_t)n);
+    r->n += n;
+}
+static void mr_str(MdRun *r, const char *s, unsigned char st) {
+    mr_add(r, s, (int)strlen(s), st);
+}
+static void mr_rep(MdRun *r, const char *glyph, int times, unsigned char st) {
+    int n = (int)strlen(glyph);
+    for (int i = 0; i < times; i++) mr_add(r, glyph, n, st);
+}
+static void mr_slice(MdRun *d, const MdRun *s, int from, int to) {
+    if (to <= from) return;
+    mr_room(d, to - from);
+    memcpy(d->s + d->n, s->s + from, (size_t)(to - from));
+    memcpy(d->a + d->n, s->a + from, (size_t)(to - from));
+    d->n += to - from;
+}
+static void mr_cat(MdRun *d, const MdRun *s) { mr_slice(d, s, 0, s->n); }
+static void mr_free(MdRun *r) {
+    free(r->s); free(r->a);
+    r->s = NULL; r->a = NULL; r->n = r->cap = 0;
+}
+/* columns a byte range occupies — continuation bytes don't take one */
+static int md_cols(const char *s, int n) {
+    int k = 0;
+    for (int i = 0; i < n; i++) if (((unsigned char)s[i] & 0xc0) != 0x80) k++;
+    return k;
+}
+/* byte offset of column k */
+static int md_byte_at(const char *s, int n, int k) {
+    int i = 0;
+    while (i < n && k > 0) {
+        i++;
+        while (i < n && ((unsigned char)s[i] & 0xc0) == 0x80) i++;
+        k--;
+    }
+    return i;
+}
+
+static void md_push(Md *m, const char *s, const unsigned char *a, int n, int src) {
+    if (m->n == m->cap) {
+        m->cap = m->cap ? m->cap * 2 : 128;
+        m->ln  = xrealloc(m->ln,  (size_t)m->cap * sizeof *m->ln);
+        m->at  = xrealloc(m->at,  (size_t)m->cap * sizeof *m->at);
+        m->src = xrealloc(m->src, (size_t)m->cap * sizeof *m->src);
+    }
+    Line *l = &m->ln[m->n];
+    l->s = xmalloc((size_t)n + 1);
+    l->s[n] = 0;
+    l->len = n;
+    l->cap = n + 1;
+    l->hst = 0;
+    m->at[m->n] = xmalloc((size_t)n + 1);
+    if (n) {                        /* an empty line has no buffer to copy */
+        memcpy(l->s, s, (size_t)n);
+        memcpy(m->at[m->n], a, (size_t)n);
+    }
+    m->src[m->n] = src;
+    m->n++;
+}
+static void md_clear(Md *m) {
+    for (int i = 0; i < m->n; i++) { free(m->ln[i].s); free(m->at[i]); }
+    m->n = 0;
+}
+static void md_free(Md *m) {
+    if (!m) return;
+    md_clear(m);
+    free(m->ln); free(m->at); free(m->src);
+    free(m);
+}
+
+/* ── inline markup ────────────────────────────────────────────────── */
+/* plain substring search; the GNU memmem isn't in scope under _XOPEN_SOURCE */
+static const char *md_find(const char *h, int hn, const char *n, int nn) {
+    for (int i = 0; i + nn <= hn; i++)
+        if (memcmp(h + i, n, (size_t)nn) == 0) return h + i;
+    return NULL;
+}
+static int md_run_of(const char *s, int len, int i, char c) {
+    int n = 0;
+    while (i + n < len && s[i + n] == c) n++;
+    return n;
+}
+static void md_inline(MdRun *o, const char *s, int len, unsigned char base, int depth);
+
+/* [text](url "title") — emit the text, then the target when it adds
+ * something. A terminal can't be clicked, so a link that hides its URL is a
+ * dead end; one that shows it is at least copyable. */
+static void md_link(MdRun *o, const char *txt, int tl, const char *url, int ul,
+                    unsigned char base, int depth) {
+    while (ul > 0 && (url[0] == ' ' || url[0] == '<')) { url++; ul--; }
+    while (ul > 0 && (url[ul-1] == ' ' || url[ul-1] == '>')) ul--;
+    for (int q = 0; q + 1 < ul; q++)             /* drop a trailing title */
+        if (url[q] == ' ' && (url[q+1] == '"' || url[q+1] == '\'')) { ul = q; break; }
+    md_inline(o, txt, tl, MS_ADD(MS_COL(base, MC_LINK), MS_UNDER), depth + 1);
+    if (ul > 0 && !(ul == tl && memcmp(url, txt, (size_t)ul) == 0)) {
+        unsigned char st = MS_ADD(MS_COL(base, MC_META), MS_DIM);
+        mr_str(o, " (", st);
+        mr_add(o, url, ul, st);
+        mr_str(o, ")", st);
+    }
+}
+static void md_inline(MdRun *o, const char *s, int len, unsigned char base, int depth) {
+    if (depth > MD_MAXDEPTH) { mr_add(o, s, len, base); return; }
+    for (int i = 0; i < len; ) {
+        char c = s[i];
+        if (c == '\\' && i + 1 < len && strchr("\\`*_{}[]()#+-.!|~<>\"", s[i+1])) {
+            mr_add(o, s + i + 1, 1, base);
+            i += 2;
+            continue;
+        }
+        if (c == '`') {                                    /* code span */
+            int run = md_run_of(s, len, i, '`'), j = i + run, close = -1;
+            while (j < len) {
+                if (s[j] != '`') { j++; continue; }
+                int r2 = md_run_of(s, len, j, '`');
+                if (r2 == run) { close = j; break; }
+                j += r2;
+            }
+            if (close < 0) { mr_add(o, s + i, run, base); i += run; continue; }
+            int a = i + run, z = close;
+            if (z - a >= 2 && s[a] == ' ' && s[z-1] == ' ') { a++; z--; }
+            mr_add(o, s + a, z - a, MS_COL(base, MC_CODE));
+            i = close + run;
+            continue;
+        }
+        if (c == '<') {                       /* autolink, or an HTML tag */
+            const char *gt = memchr(s + i + 1, '>', (size_t)(len - i - 1));
+            int n = gt ? (int)(gt - (s + i + 1)) : 0;
+            if (gt && n > 0 && !memchr(s + i + 1, ' ', (size_t)n) &&
+                (md_find(s + i + 1, n, "://", 3) ||
+                 memchr(s + i + 1, '@', (size_t)n))) {
+                mr_add(o, s + i + 1, n, MS_ADD(MS_COL(base, MC_LINK), MS_UNDER));
+                i += n + 2;
+                continue;
+            }
+            /* a real tag carries no meaning in a terminal — drop it */
+            if (gt && (isalpha((unsigned char)s[i+1]) || s[i+1] == '/' || s[i+1] == '!')) {
+                i += n + 2;
+                continue;
+            }
+        }
+        if (c == '!' && i + 1 < len && s[i+1] == '[') {      /* image */
+            const char *close = memchr(s + i + 2, ']', (size_t)(len - i - 2));
+            if (close && close + 1 < s + len && close[1] == '(') {
+                const char *end = memchr(close + 2, ')', (size_t)(len - (close + 2 - s)));
+                if (end) {
+                    unsigned char st = MS_ADD(MS_COL(base, MC_META), MS_DIM);
+                    mr_str(o, "[image", st);
+                    if (close > s + i + 2) {
+                        mr_str(o, ": ", st);
+                        mr_add(o, s + i + 2, (int)(close - (s + i + 2)), st);
+                    }
+                    mr_str(o, "]", st);
+                    i = (int)(end - s) + 1;
+                    continue;
+                }
+            }
+        }
+        if (c == '[') {                                       /* link */
+            int j = i + 1, nest = 1;
+            while (j < len && nest) {
+                if (s[j] == '\\') j++;
+                else if (s[j] == '[') nest++;
+                else if (s[j] == ']') nest--;
+                j++;
+            }
+            if (nest == 0) {
+                const char *txt = s + i + 1;
+                int tl = (int)((s + j - 1) - txt);
+                if (j < len && s[j] == '(') {
+                    int k = j + 1, par = 1;
+                    while (k < len && par) {
+                        if (s[k] == '(') par++;
+                        else if (s[k] == ')') par--;
+                        k++;
+                    }
+                    if (par == 0) {
+                        md_link(o, txt, tl, s + j + 1, (int)((s + k - 1) - (s + j + 1)),
+                                base, depth);
+                        i = k;
+                        continue;
+                    }
+                }
+                /* [text][ref] and [ref] — the target lives elsewhere in the
+                 * file, so show the text and leave the brackets out */
+                int k = j;
+                if (k < len && s[k] == '[') {
+                    const char *e = memchr(s + k, ']', (size_t)(len - k));
+                    if (e) k = (int)(e - s) + 1;
+                }
+                if (k > j || (j < len && s[j] != ':')) {
+                    md_inline(o, txt, tl, MS_ADD(MS_COL(base, MC_LINK), MS_UNDER),
+                              depth + 1);
+                    i = k;
+                    continue;
+                }
+            }
+        }
+        if (c == '~' && i + 1 < len && s[i+1] == '~') {        /* strikethrough */
+            const char *e = md_find(s + i + 2, len - i - 2, "~~", 2);
+            if (e) {
+                md_inline(o, s + i + 2, (int)(e - (s + i + 2)),
+                          MS_ADD(base, MS_DIM), depth + 1);
+                i = (int)(e - s) + 2;
+                continue;
+            }
+        }
+        if (c == '*' || c == '_') {                            /* emphasis */
+            int run = md_run_of(s, len, i, c);
+            int want = run >= 2 ? 2 : 1;
+            /* snake_case is not emphasis, so an underscore only opens one at
+             * a word boundary; an opener also can't be followed by a space */
+            int ok = !(c == '_' && i > 0 && word_ch((unsigned char)s[i-1])) &&
+                     i + want < len && !isspace((unsigned char)s[i + want]);
+            int close = -1;
+            for (int j = i + want; ok && j < len; ) {
+                if (s[j] == '\\') { j += 2; continue; }
+                if (s[j] != c) { j++; continue; }
+                int r2 = md_run_of(s, len, j, c);
+                if (r2 >= want && !isspace((unsigned char)s[j-1])) { close = j; break; }
+                j += r2;
+            }
+            if (close > 0) {
+                md_inline(o, s + i + want, close - (i + want),
+                          MS_ADD(base, want == 2 ? MS_BOLD : MS_ITAL), depth + 1);
+                i = close + want;
+                continue;
+            }
+            mr_add(o, s + i, run, base);
+            i += run;
+            continue;
+        }
+        int adv = 1;
+        while (i + adv < len && ((unsigned char)s[i + adv] & 0xc0) == 0x80) adv++;
+        mr_add(o, s + i, adv, base);
+        i += adv;
+    }
+}
+
+/* ── block markup ─────────────────────────────────────────────────── */
+/* One source line, already detached from the buffer so a nested block can be
+ * re-indented without touching the file. */
+typedef struct { const char *s; int len, src; } MdSrc;
+
+/* Where output goes. `pre` prefixes the first line this context emits and
+ * `cont` every line after it, which is what puts a bullet on an item's first
+ * row and spaces under it. A nested block builds its prefixes on top of its
+ * parent's, taking the parent's unspent `pre` with it — an item's bullet
+ * belongs on the first line of whatever is nested inside the item, since
+ * that is the line that gets printed first. */
+typedef struct {
+    Md    *m;
+    int    width;
+    MdRun  pre, cont;
+    int    pw;                 /* columns the prefix takes */
+    int    spent;              /* has `pre` been printed yet? */
+    int    ldepth;             /* lists nested so far, for the bullet glyph */
+    unsigned char base;        /* style prose starts from, e.g. inside a quote */
+} MdCtx;
+
+static void md_ctx_child(MdCtx *out, MdCtx *par, const char *first,
+                         const char *rest, unsigned char st) {
+    memset(out, 0, sizeof *out);
+    out->m = par->m;
+    out->width = par->width;
+    out->ldepth = par->ldepth;
+    out->base = par->base;
+    mr_cat(&out->pre, par->spent ? &par->cont : &par->pre);
+    par->spent = 1;
+    mr_str(&out->pre, first, st);
+    mr_cat(&out->cont, &par->cont);
+    mr_str(&out->cont, rest, st);
+    /* both prefixes must be the same width or a wrapped line would jump */
+    int a = md_cols(out->pre.s, out->pre.n), b = md_cols(out->cont.s, out->cont.n);
+    for (; b < a; b++) mr_str(&out->cont, " ", st);
+    for (; a < b; a++) mr_str(&out->pre, " ", st);
+    out->pw = a > b ? a : b;
+}
+static void md_ctx_free(MdCtx *c) { mr_free(&c->pre); mr_free(&c->cont); }
+
+/* Wrap `body` to the context width and push it out, prefix included. */
+static void md_out(MdCtx *c, MdRun *body, int src) {
+    static MdRun line;                       /* one scratch line, reused */
+    int avail = c->width - c->pw;
+    if (avail < 8) avail = 8;
+    int n = body->n;
+    while (n > 0 && body->s[n-1] == ' ') n--;
+    for (int i = 0;;) {
+        int j = i, cols = 0, brk = -1;
+        while (j < n && cols < avail) {
+            if (body->s[j] == ' ' && j > i) brk = j;
+            j++;
+            while (j < n && ((unsigned char)body->s[j] & 0xc0) == 0x80) j++;
+            cols++;
+        }
+        int take = (j < n && brk > i) ? brk : j;
+        int e = take;
+        while (e > i && body->s[e-1] == ' ') e--;
+        line.n = 0;
+        mr_cat(&line, c->spent ? &c->cont : &c->pre);
+        c->spent = 1;
+        mr_slice(&line, body, i, e);
+        md_push(c->m, line.s, line.a, line.n, src);
+        i = take;
+        while (i < n && body->s[i] == ' ') i++;
+        if (i >= n) break;
+    }
+}
+/* Push a line that must not be re-wrapped (rules, code, table rows). */
+static void md_raw(MdCtx *c, MdRun *body, int src) {
+    static MdRun line;
+    line.n = 0;
+    mr_cat(&line, c->spent ? &c->cont : &c->pre);
+    c->spent = 1;
+    mr_cat(&line, body);
+    md_push(c->m, line.s, line.a, line.n, src);
+}
+static void md_blank(MdCtx *c, int src) {
+    if (c->m->n) {                                   /* never two in a row */
+        Line *l = &c->m->ln[c->m->n - 1];
+        int i = 0;
+        while (i < l->len && l->s[i] == ' ') i++;
+        if (i == l->len) return;
+    }
+    MdRun empty = { 0 };
+    md_out(c, &empty, src);
+}
+
+/* strip the leading indent, in columns, and any trailing whitespace */
+static void md_split(const MdSrc *l, int *ind, const char **body, int *blen) {
+    int i = 0, col = 0;
+    while (i < l->len && (l->s[i] == ' ' || l->s[i] == '\t')) {
+        col += l->s[i] == '\t' ? 4 - col % 4 : 1;
+        i++;
+    }
+    int e = l->len;
+    while (e > i && (l->s[e-1] == ' ' || l->s[e-1] == '\t' || l->s[e-1] == '\r')) e--;
+    *ind = col;
+    *body = l->s + i;
+    *blen = e - i;
+}
+static int md_is_hr(const char *s, int n) {
+    if (n < 3) return 0;
+    char c = s[0];
+    if (c != '-' && c != '*' && c != '_') return 0;
+    int k = 0;
+    for (int i = 0; i < n; i++) {
+        if (s[i] == c) k++;
+        else if (s[i] != ' ' && s[i] != '\t') return 0;
+    }
+    return k >= 3;
+}
+static int md_is_fence(const char *s, int n, char *ch, int *fl) {
+    if (n < 3 || (s[0] != '`' && s[0] != '~')) return 0;
+    int k = md_run_of(s, n, 0, s[0]);
+    if (k < 3) return 0;
+    if (ch) *ch = s[0];
+    if (fl) *fl = k;
+    return 1;
+}
+static int md_atx(const char *s, int n, int *lvl, int *ts, int *tl) {
+    int k = md_run_of(s, n, 0, '#');
+    if (k < 1 || k > 6) return 0;
+    if (k < n && s[k] != ' ' && s[k] != '\t') return 0;
+    int a = k;
+    while (a < n && (s[a] == ' ' || s[a] == '\t')) a++;
+    int e = n;
+    while (e > a && s[e-1] == '#') e--;              /* a closing ### run */
+    if (e > a && s[e-1] != ' ') e = n;
+    while (e > a && s[e-1] == ' ') e--;
+    *lvl = k; *ts = a; *tl = e - a;
+    return 1;
+}
+static int md_setext(const char *s, int n) {
+    if (n < 1) return 0;
+    if (s[0] != '=' && s[0] != '-') return 0;
+    for (int i = 1; i < n; i++) if (s[i] != s[0]) return 0;
+    return s[0] == '=' ? 1 : 2;
+}
+/* "- ", "* ", "+ ", "1. ", "2) " → marker length, and the number or -1 */
+static int md_bullet(const char *s, int n, int *mlen, int *ord) {
+    if (n >= 2 && (s[0] == '-' || s[0] == '*' || s[0] == '+') &&
+        (s[1] == ' ' || s[1] == '\t')) {
+        int k = 1;
+        while (k < n && (s[k] == ' ' || s[k] == '\t')) k++;
+        *mlen = k; *ord = -1;
+        return 1;
+    }
+    int d = 0;
+    while (d < n && isdigit((unsigned char)s[d])) d++;
+    if (d > 0 && d < n && (s[d] == '.' || s[d] == ')') &&
+        d + 1 < n && (s[d+1] == ' ' || s[d+1] == '\t')) {
+        int k = d + 1;
+        while (k < n && (s[k] == ' ' || s[k] == '\t')) k++;
+        *mlen = k;
+        *ord = atoi(s);
+        return 1;
+    }
+    return 0;
+}
+/* does this line start a block that a paragraph or list item can't absorb? */
+static int md_starts_block(const char *s, int n) {
+    int lvl, ts, tl, ml, ord;
+    return n == 0 || s[0] == '>' || md_is_hr(s, n) || md_is_fence(s, n, NULL, NULL) ||
+           md_atx(s, n, &lvl, &ts, &tl) || md_bullet(s, n, &ml, &ord);
+}
+static int md_is_tablesep(const char *s, int n) {
+    int dash = 0, bar = 0;
+    for (int i = 0; i < n; i++) {
+        if (s[i] == '-') dash++;
+        else if (s[i] == '|') bar++;
+        else if (s[i] != ':' && s[i] != ' ' && s[i] != '\t') return 0;
+    }
+    return dash >= 1 && bar >= 1;
+}
+/* split a table row on unescaped pipes; returns the cell count */
+static int md_cells(const char *s, int n, const char **cs, int *cl, int max) {
+    int k = 0, i = 0;
+    if (i < n && s[i] == '|') i++;
+    int start = i;
+    for (; i <= n; i++) {
+        if (i < n && s[i] == '\\') { i++; continue; }
+        if (i < n && s[i] != '|') continue;
+        int a = start, e = i;
+        while (a < e && s[a] == ' ') a++;
+        while (e > a && s[e-1] == ' ') e--;
+        if (i == n && a >= e && k > 0) break;        /* trailing "|" */
+        if (k < max) { cs[k] = s + a; cl[k] = e - a; k++; }
+        start = i + 1;
+    }
+    return k;
+}
+
+static void md_block(MdCtx *c, MdSrc *L, int n, int depth);
+
+/* A table, laid out in columns that fit the pane. Cells are rendered inline
+ * and then truncated rather than wrapped: a wrapped cell needs a row model
+ * this viewer doesn't have, and a truncated one still lines up. */
+static int md_table(MdCtx *c, MdSrc *L, int n, int at) {
+    int rows = 0;
+    while (at + rows < n) {
+        int ind, bl; const char *b;
+        md_split(&L[at + rows], &ind, &b, &bl);
+        if (bl == 0 || !memchr(b, '|', (size_t)bl)) break;
+        rows++;
+    }
+    if (rows < 2) return 0;
+    int ind, bl; const char *b;
+    md_split(&L[at + 1], &ind, &b, &bl);
+    if (!md_is_tablesep(b, bl)) return 0;
+
+    const char *cs[MD_MAXCOL]; int cl[MD_MAXCOL];
+    md_split(&L[at + 1], &ind, &b, &bl);
+    int ncol = md_cells(b, bl, cs, cl, MD_MAXCOL);
+    if (ncol < 1) return 0;
+    char align[MD_MAXCOL];
+    for (int i = 0; i < ncol; i++) {
+        int l = cl[i] > 0 && cs[i][0] == ':', r = cl[i] > 0 && cs[i][cl[i]-1] == ':';
+        align[i] = (char)(l && r ? 'c' : r ? 'r' : 'l');
+    }
+    int nrow = rows - 1;                       /* the separator isn't a row */
+    MdRun *cell = xmalloc((size_t)nrow * ncol * sizeof *cell);
+    memset(cell, 0, (size_t)nrow * ncol * sizeof *cell);
+    int w[MD_MAXCOL];
+    for (int i = 0; i < ncol; i++) w[i] = 1;
+    for (int r = 0; r < nrow; r++) {
+        int sl = at + (r == 0 ? 0 : r + 1);
+        md_split(&L[sl], &ind, &b, &bl);
+        int k = md_cells(b, bl, cs, cl, MD_MAXCOL);
+        for (int i = 0; i < ncol; i++) {
+            MdRun *u = &cell[r * ncol + i];
+            if (i < k) md_inline(u, cs[i], cl[i],
+                                 r ? c->base : MS_ADD(c->base, MS_BOLD), 0);
+            int cw = md_cols(u->s, u->n);
+            if (cw > w[i]) w[i] = cw;
+        }
+    }
+    /* shrink the widest column until the row fits, then let it overflow */
+    int avail = c->width - c->pw, total;
+    for (;;) {
+        total = 3 * (ncol - 1);
+        for (int i = 0; i < ncol; i++) total += w[i];
+        if (total <= avail) break;
+        int big = 0;
+        for (int i = 1; i < ncol; i++) if (w[i] > w[big]) big = i;
+        if (w[big] <= 4) break;
+        w[big]--;
+    }
+    MdRun line = { 0 };
+    for (int r = 0; r < nrow; r++) {
+        line.n = 0;
+        for (int i = 0; i < ncol; i++) {
+            if (i) mr_str(&line, " │ ", MST(MC_RULE, MS_DIM));
+            MdRun *u = &cell[r * ncol + i];
+            int cw = md_cols(u->s, u->n);
+            if (cw > w[i]) {
+                mr_slice(&line, u, 0, md_byte_at(u->s, u->n, w[i] - 1));
+                mr_str(&line, "…", MST(MC_META, MS_DIM));
+                cw = w[i];
+            } else {
+                int pad = w[i] - cw, lead = align[i] == 'r' ? pad
+                                          : align[i] == 'c' ? pad / 2 : 0;
+                mr_rep(&line, " ", lead, c->base);
+                mr_cat(&line, u);
+                mr_rep(&line, " ", pad - lead, c->base);
+            }
+        }
+        md_raw(c, &line, L[at + (r == 0 ? 0 : r + 1)].src);
+        if (r == 0) {                                    /* header underline */
+            line.n = 0;
+            for (int i = 0; i < ncol; i++) {
+                if (i) mr_str(&line, "─┼─", MST(MC_RULE, MS_DIM));
+                mr_rep(&line, "─", w[i], MST(MC_RULE, MS_DIM));
+            }
+            md_raw(c, &line, L[at + 1].src);
+        }
+    }
+    mr_free(&line);
+    for (int i = 0; i < nrow * ncol; i++) mr_free(&cell[i]);
+    free(cell);
+    return rows;
+}
+
+static void md_heading(MdCtx *c, int lvl, const char *s, int n, int src) {
+    MdRun t = { 0 };
+    md_inline(&t, s, n, MST(MC_HEAD, MS_BOLD), 0);
+    if (c->m->n) md_blank(c, src);
+    md_out(c, &t, src);
+    if (lvl <= 2) {                    /* the two top levels get a rule under */
+        int wide = md_cols(t.s, t.n), avail = c->width - c->pw;
+        if (wide > avail) wide = avail;
+        MdRun r = { 0 };
+        mr_rep(&r, lvl == 1 ? "═" : "─", wide, MST(MC_HEAD, MS_DIM));
+        md_raw(c, &r, src);
+        mr_free(&r);
+    }
+    mr_free(&t);
+}
+
+/* A list item: everything belonging to it is re-indented and rendered as a
+ * block of its own, so an item can hold paragraphs, code or another list. */
+static int md_item(MdCtx *c, MdSrc *L, int n, int at, int depth) {
+    int ind, bl; const char *b;
+    md_split(&L[at], &ind, &b, &bl);
+    int mlen, ord;
+    md_bullet(b, bl, &mlen, &ord);
+    int cind = ind + mlen;
+
+    int e = at + 1;
+    while (e < n) {
+        int i2, l2; const char *b2;
+        md_split(&L[e], &i2, &b2, &l2);
+        if (l2 == 0) {                     /* a blank only holds the item open
+                                            * if indented content follows it */
+            int k = e + 1;
+            while (k < n) {
+                int i3, l3; const char *b3;
+                md_split(&L[k], &i3, &b3, &l3);
+                if (l3 == 0) { k++; continue; }
+                if (i3 >= cind) break;
+                k = n;
+            }
+            if (k >= n) break;
+            e++;
+            continue;
+        }
+        if (i2 >= cind) { e++; continue; }
+        if (md_starts_block(b2, l2)) break;
+        e++;                               /* lazy continuation of the text */
+    }
+
+    int cnt = e - at;
+    MdSrc *sub = xmalloc((size_t)cnt * sizeof *sub);
+    sub[0].s = b + mlen; sub[0].len = bl - mlen; sub[0].src = L[at].src;
+    for (int i = 1; i < cnt; i++) {
+        int i2, l2; const char *b2;
+        md_split(&L[at + i], &i2, &b2, &l2);
+        /* dedent by the item's content indent, no further */
+        int drop = i2 < cind ? i2 : cind;
+        const char *p = L[at + i].s;
+        int col = 0, k = 0;
+        while (k < L[at + i].len && col < drop &&
+               (p[k] == ' ' || p[k] == '\t')) {
+            col += p[k] == '\t' ? 4 - col % 4 : 1;
+            k++;
+        }
+        int en = L[at + i].len;
+        while (en > k && (p[en-1] == ' ' || p[en-1] == '\r')) en--;
+        sub[i].s = p + k; sub[i].len = en - k; sub[i].src = L[at + i].src;
+    }
+
+    char mark[16];
+    if (ord >= 0) snprintf(mark, sizeof mark, "%d. ", ord);
+    else {
+        int d = c->ldepth;
+        snprintf(mark, sizeof mark, "%s", d == 0 ? "• " : d == 1 ? "◦ " : "▪ ");
+    }
+    /* a task list reads better as a box than as literal brackets */
+    if (sub[0].len >= 3 && sub[0].s[0] == '[' && sub[0].s[2] == ']' &&
+        (sub[0].len == 3 || sub[0].s[3] == ' ')) {
+        char t = sub[0].s[1];
+        if (t == ' ' || t == 'x' || t == 'X') {
+            snprintf(mark, sizeof mark, "%s ", t == ' ' ? "[ ]" : "[x]");
+            int cut = sub[0].len > 3 ? 4 : 3;
+            sub[0].s += cut; sub[0].len -= cut;
+        }
+    }
+    char pad[16];
+    snprintf(pad, sizeof pad, "%*s", md_cols(mark, (int)strlen(mark)), "");
+    MdCtx ic;
+    md_ctx_child(&ic, c, mark, pad, MST(MC_MARK, 0));
+    ic.ldepth = c->ldepth + 1;
+    md_block(&ic, sub, cnt, depth + 1);
+    md_ctx_free(&ic);
+    free(sub);
+    return cnt;
+}
+
+static void md_block(MdCtx *c, MdSrc *L, int n, int depth) {
+    MdRun para = { 0 };
+    for (int i = 0; i < n; ) {
+        int ind, bl; const char *b;
+        md_split(&L[i], &ind, &b, &bl);
+        int src = L[i].src;
+
+        if (bl == 0) { md_blank(c, src); i++; continue; }
+
+        char fc; int fl;
+        if (ind < 4 && md_is_fence(b, bl, &fc, &fl)) {      /* fenced code */
+            int e = i + 1;
+            while (e < n) {
+                int i2, l2; const char *b2;
+                md_split(&L[e], &i2, &b2, &l2);
+                char c2; int l3;
+                if (md_is_fence(b2, l2, &c2, &l3) && c2 == fc && l3 >= fl) break;
+                e++;
+            }
+            MdRun r = { 0 };
+            for (int k = i + 1; k < e; k++) {
+                r.n = 0;
+                int drop = ind, col = 0, j = 0;
+                const char *p = L[k].s;
+                while (j < L[k].len && col < drop && (p[j] == ' ' || p[j] == '\t')) {
+                    col += p[j] == '\t' ? 4 - col % 4 : 1;
+                    j++;
+                }
+                mr_str(&r, "  ", MST(MC_CODE, 0));
+                mr_add(&r, p + j, L[k].len - j, MST(MC_CODE, 0));
+                md_raw(c, &r, L[k].src);
+            }
+            mr_free(&r);
+            i = e < n ? e + 1 : e;
+            continue;
+        }
+        if (ind >= 4 && depth == 0) {                     /* indented code */
+            int e = i;
+            while (e < n) {
+                int i2, l2; const char *b2;
+                md_split(&L[e], &i2, &b2, &l2);
+                if (l2 == 0) {                 /* blanks only if code resumes */
+                    int k = e + 1;
+                    while (k < n) {
+                        int i3, l3; const char *b3;
+                        md_split(&L[k], &i3, &b3, &l3);
+                        if (l3 == 0) { k++; continue; }
+                        if (i3 >= 4) break;
+                        k = n;
+                    }
+                    if (k >= n) break;
+                    e++;
+                    continue;
+                }
+                if (i2 < 4) break;
+                e++;
+            }
+            MdRun r = { 0 };
+            for (int k = i; k < e; k++) {
+                int i2, l2; const char *b2;
+                md_split(&L[k], &i2, &b2, &l2);
+                r.n = 0;
+                mr_str(&r, "  ", MST(MC_CODE, 0));
+                mr_rep(&r, " ", i2 - 4, MST(MC_CODE, 0));
+                mr_add(&r, b2, l2, MST(MC_CODE, 0));
+                md_raw(c, &r, L[k].src);
+            }
+            mr_free(&r);
+            i = e;
+            continue;
+        }
+        int lvl, ts, tl;
+        if (md_atx(b, bl, &lvl, &ts, &tl)) {                    /* # heading */
+            md_heading(c, lvl, b + ts, tl, src);
+            i++;
+            continue;
+        }
+        if (md_is_hr(b, bl)) {                             /* thematic break */
+            int avail = c->width - c->pw;
+            MdRun r = { 0 };
+            mr_rep(&r, "─", avail > 0 ? avail : 1, MST(MC_RULE, MS_DIM));
+            md_raw(c, &r, src);
+            mr_free(&r);
+            i++;
+            continue;
+        }
+        if (b[0] == '>') {                                    /* blockquote */
+            int e = i;
+            while (e < n) {
+                int i2, l2; const char *b2;
+                md_split(&L[e], &i2, &b2, &l2);
+                if (l2 == 0) break;
+                if (b2[0] != '>' && (e == i || md_starts_block(b2, l2))) break;
+                e++;
+            }
+            int cnt = e - i;
+            MdSrc *sub = xmalloc((size_t)cnt * sizeof *sub);
+            for (int k = 0; k < cnt; k++) {
+                int i2, l2; const char *b2;
+                md_split(&L[i + k], &i2, &b2, &l2);
+                if (l2 && b2[0] == '>') {
+                    b2++; l2--;
+                    if (l2 && b2[0] == ' ') { b2++; l2--; }
+                }
+                sub[k].s = b2; sub[k].len = l2; sub[k].src = L[i + k].src;
+            }
+            MdCtx qc;
+            md_ctx_child(&qc, c, "│ ", "│ ", MST(MC_RULE, MS_DIM));
+            qc.base = MS_COL(c->base, MC_QUOTE);
+            if (depth < MD_MAXDEPTH) md_block(&qc, sub, cnt, depth + 1);
+            md_ctx_free(&qc);
+            free(sub);
+            i = e;
+            continue;
+        }
+        int mlen, ord;
+        if (md_bullet(b, bl, &mlen, &ord) && depth < MD_MAXDEPTH) {
+            i += md_item(c, L, n, i, depth);
+            continue;
+        }
+        if (memchr(b, '|', (size_t)bl)) {                          /* table */
+            int used = md_table(c, L, n, i);
+            if (used) { i += used; continue; }
+        }
+        /* paragraph: run on until a blank line or a new block, honouring the
+         * two-space hard break and a "===" underline turning it into a head */
+        para.n = 0;
+        int e = i;
+        while (e < n) {
+            int i2, l2; const char *b2;
+            md_split(&L[e], &i2, &b2, &l2);
+            if (l2 == 0) break;
+            if (e > i) {
+                int st = md_setext(b2, l2);
+                if (st) {
+                    md_heading(c, st, para.s, para.n, src);
+                    para.n = 0;
+                    e++;
+                    break;
+                }
+                if (md_starts_block(b2, l2) || md_is_tablesep(b2, l2)) break;
+            }
+            if (para.n) mr_add(&para, " ", 1, c->base);
+            int hard = L[e].len >= 2 && L[e].s[L[e].len-1] == ' ' &&
+                       L[e].s[L[e].len-2] == ' ';
+            if (l2 && b2[l2-1] == '\\') { l2--; hard = 1; }
+            md_inline(&para, b2, l2, c->base, 0);
+            e++;
+            if (hard) { md_out(c, &para, L[e-1].src); para.n = 0; }
+        }
+        if (para.n) md_out(c, &para, src);
+        i = e > i ? e : i + 1;
+    }
+    mr_free(&para);
+}
+
+/* Rebuild `b`'s rendered view for a pane `width` columns wide. */
+static void md_render(Buf *b, int width) {
+    if (!b->md) b->md = calloc(1, sizeof *b->md);
+    Md *m = b->md;
+    if (!m) die("out of memory");
+    md_clear(m);
+    m->laid_w = width;
+    m->ver = b->ver;
+    if (width < 12) width = 12;
+    if (cfg_md_width > 0 && width > cfg_md_width) width = cfg_md_width;
+
+    MdSrc *L = xmalloc((size_t)b->n * sizeof *L);
+    int n = 0;
+    for (int i = 0; i < b->n; i++) {
+        L[n].s = b->ln[i].s;
+        L[n].len = b->ln[i].len;
+        L[n].src = i;
+        n++;
+    }
+    MdCtx c;
+    memset(&c, 0, sizeof c);
+    c.m = m;
+    c.width = width;
+
+    int at = 0;
+    /* YAML front matter is metadata, not prose — show it as such */
+    if (n > 1 && L[0].len == 3 && memcmp(L[0].s, "---", 3) == 0) {
+        int e = 1;
+        while (e < n && !(L[e].len == 3 &&
+                          (memcmp(L[e].s, "---", 3) == 0 ||
+                           memcmp(L[e].s, "...", 3) == 0))) e++;
+        if (e < n) {
+            MdRun r = { 0 };
+            for (int k = 1; k < e; k++) {
+                r.n = 0;
+                mr_add(&r, L[k].s, L[k].len, MST(MC_META, MS_DIM));
+                md_raw(&c, &r, L[k].src);
+            }
+            mr_free(&r);
+            at = e + 1;
+        }
+    }
+    md_block(&c, L + at, n - at, 0);
+    free(L);
+    md_ctx_free(&c);
+    if (m->n == 0) md_push(m, "", (const unsigned char *)"", 0, 0);
+    if (m->rowoff > m->n - 1) m->rowoff = m->n - 1;
+    if (m->rowoff < 0) m->rowoff = 0;
+}
+/* The render is only valid for the width and the buffer version it was made
+ * from; anything else and it is built again. */
+static Md *md_view_of(Buf *b, int width) {
+    if (!b->md || b->md->laid_w != width || b->md->ver != b->ver)
+        md_render(b, width);
+    return b->md;
+}
+/* Rendered line showing source line `sy` — used to keep the reading position
+ * when the view is toggled. */
+static int md_row_for_src(Md *m, int sy) {
+    for (int i = 0; i < m->n; i++)
+        if (m->src[i] >= sy) return i;         /* the top of that block */
+    return m->n ? m->n - 1 : 0;
+}
+static int md_is_md(Buf *b) {
+    return b->kind == TAB_FILE && b->lang && b->lang->md;
+}
+
 static int is_pdf_path(const char *path) {
     const char *dot = strrchr(path, '.');
     return dot && !strcasecmp(dot, ".pdf");
@@ -2384,6 +3293,7 @@ static void open_file(const char *path) {
     Buf *b = is_pdf_path(path) ? pdf_load(path) : buf_load(path);
     if (!b) { set_msg("can't open %s", path); return; }
     if (b->kind != TAB_PDF) b->kind = TAB_FILE;
+    if (cfg_md_preview && md_is_md(b)) b->md_view = 1;
     tabs[ntabs++] = b;
     set_cur(ntabs - 1);
 }
@@ -2674,9 +3584,92 @@ static int tok_at(const char *s, int len, int i, const char *tok) {
     return tl && i + tl <= len && memcmp(s + i, tok, (size_t)tl) == 0;
 }
 /* lex one line; fills attr[0..len) if attr != NULL; returns end state */
+/* Markdown in the *source* view. The keyword lexer has nothing useful to say
+ * about prose, so markdown gets its own line pass — enough to see the
+ * structure while editing — carrying the fenced-code state across lines in
+ * the same `hst` field every other language uses. */
+static int md_lex(const char *s, int len, int st, unsigned char *attr) {
+#define MDA(i, a) do { if (attr) attr[i] = (unsigned char)(a); } while (0)
+    if (attr) memset(attr, HA_DEF, (size_t)len);
+    int i = 0;
+    while (i < len && (s[i] == ' ' || s[i] == '\t')) i++;
+    char fc; int fl;
+    if (md_is_fence(s + i, len - i, &fc, &fl)) {
+        for (int k = 0; k < len; k++) MDA(k, HA_STR);
+        return st == ST_MDFENCE ? ST_NORM : ST_MDFENCE;
+    }
+    if (st == ST_MDFENCE) {
+        for (int k = 0; k < len; k++) MDA(k, HA_STR);
+        return ST_MDFENCE;
+    }
+    int lvl, ts, tl;
+    if (md_atx(s + i, len - i, &lvl, &ts, &tl) || md_is_hr(s + i, len - i) ||
+        md_setext(s + i, len - i)) {
+        for (int k = i; k < len; k++) MDA(k, HA_PRE);
+        return ST_NORM;
+    }
+    if (i < len && s[i] == '>') {
+        for (int k = i; k < len; k++) MDA(k, HA_COM);
+        return ST_NORM;
+    }
+    int mlen, ord;
+    if (md_bullet(s + i, len - i, &mlen, &ord))
+        for (int k = i; k < i + mlen && k < len; k++) MDA(k, HA_KW);
+    for (int k = i; k < len; ) {
+        if (s[k] == '\\') { k += 2; continue; }
+        if (s[k] == '`') {                                    /* code span */
+            int run = md_run_of(s, len, k, '`'), j = k + run, close = -1;
+            while (j < len) {
+                if (s[j] != '`') { j++; continue; }
+                int r2 = md_run_of(s, len, j, '`');
+                if (r2 == run) { close = j; break; }
+                j += r2;
+            }
+            int e = close < 0 ? k + run : close + run;
+            for (int q = k; q < e; q++) MDA(q, HA_STR);
+            k = e;
+            continue;
+        }
+        if (s[k] == '*' || s[k] == '_') {                      /* emphasis */
+            int run = md_run_of(s, len, k, s[k]);
+            int want = run >= 2 ? 2 : 1, close = -1;
+            if (!(s[k] == '_' && k > i && word_ch((unsigned char)s[k-1])) &&
+                k + want < len && !isspace((unsigned char)s[k + want]))
+                for (int j = k + want; j < len; ) {
+                    if (s[j] != s[k]) { j++; continue; }
+                    int r2 = md_run_of(s, len, j, s[k]);
+                    if (r2 >= want && !isspace((unsigned char)s[j-1])) { close = j; break; }
+                    j += r2;
+                }
+            if (close < 0) { k += run; continue; }
+            for (int q = k; q < close + want; q++) MDA(q, HA_KW);
+            k = close + want;
+            continue;
+        }
+        if (s[k] == '[') {                                         /* link */
+            const char *e = memchr(s + k, ']', (size_t)(len - k));
+            if (!e) { k++; continue; }
+            int close = (int)(e - s);
+            for (int q = k; q <= close; q++) MDA(q, HA_TYPE);
+            k = close + 1;
+            if (k < len && (s[k] == '(' || s[k] == '[')) {
+                char shut = s[k] == '(' ? ')' : ']';
+                const char *e2 = memchr(s + k, shut, (size_t)(len - k));
+                int stop = e2 ? (int)(e2 - s) : len - 1;
+                for (int q = k; q <= stop; q++) MDA(q, HA_COM);
+                k = stop + 1;
+            }
+            continue;
+        }
+        k++;
+    }
+    return ST_NORM;
+#undef MDA
+}
 static int lex_line(const Lang *lg, const char *s, int len, int st,
                     unsigned char *attr) {
 #define SETA(i, a) do { if (attr) attr[i] = (unsigned char)(a); } while (0)
+    if (lg->md) return md_lex(s, len, st, attr);
     int i = 0;
     if (attr) memset(attr, HA_DEF, (size_t)len);
     /* resume a multi-line construct */
@@ -3130,7 +4123,8 @@ static void hl_line(Buf *b, int li, unsigned char *attr) {
 
 /* ── color pairs ──────────────────────────────────────────────────── */
 enum { CP_TAB_ACT = 1, CP_TAB, CP_SEL, CP_DIR, CP_STATUS, CP_LINENO, CP_MUTED,
-       CP_KW, CP_TYPE, CP_STR, CP_COM, CP_NUM, CP_PRE, CP_FIND, CP_ERR };
+       CP_KW, CP_TYPE, CP_STR, CP_COM, CP_NUM, CP_PRE, CP_FIND, CP_ERR,
+       CP_HEAD };
 enum { OV_SEL = 1, OV_FIND = 2, OV_BRK = 4 };
 
 /* ── themes ───────────────────────────────────────────────────────── */
@@ -3325,6 +4319,7 @@ static void apply_theme(void) {
     init_pair(CP_PRE,     col_of(theme.pre),   dfl);
     init_pair(CP_FIND,    bg,                  col_of(theme.str));
     init_pair(CP_ERR,     fg,                  col_of(theme.error));
+    init_pair(CP_HEAD,    col_of(theme.accent), dfl);   /* markdown headings */
 }
 
 /* ── keybindings ──────────────────────────────────────────────────── */
@@ -3334,7 +4329,7 @@ enum { KB_QUIT, KB_SAVE, KB_CLOSE_TAB, KB_HELP, KB_RUN, KB_TERM, KB_FIND,
        KB_TREE_COLLAPSE, KB_TREE_EXPAND, KB_TREE_OPEN, KB_TREE_OPEN_PANE,
        KB_TAB_PREV, KB_TAB_NEXT, KB_WRAP, KB_SIDEBAR, KB_MOVE_UP, KB_MOVE_DOWN,
        KB_PANE_LEFT, KB_PANE_RIGHT, KB_PANE_UP, KB_PANE_DOWN, KB_PANE_CLOSE,
-       KB_N };
+       KB_MARKDOWN, KB_N };
 
 static const struct { const char *name; int dflt; } kb_def[] = {
     { "quit",          ALT('q')          }, { "save",        CTRL('s')         },
@@ -3353,7 +4348,7 @@ static const struct { const char *name; int dflt; } kb_def[] = {
     { "move_line_up",  MK(6, D_UP)       }, { "move_line_down", MK(6, D_DOWN)  },
     { "pane_left",     MK(4, D_LEFT)     }, { "pane_right",  MK(4, D_RIGHT)    },
     { "pane_up",       MK(4, D_UP)       }, { "pane_down",   MK(4, D_DOWN)     },
-    { "pane_close",    PKEY(0)           },
+    { "pane_close",    PKEY(0)           }, { "markdown",    ALT('m')          },
 };
 static int kb[KB_N];
 
@@ -3633,6 +4628,16 @@ static const char *DEFAULT_CONFIG =
 "# half-width pane. +/- change it while reading, 0 comes back here. (25-800)\n"
 "zoom = 100\n"
 "\n"
+"[markdown]\n"
+"# A .md file opens as text you can edit; the markdown key (Alt+M) swaps the\n"
+"# pane between that source and a rendered view of it — headings, lists,\n"
+"# tables, quotes and code blocks laid out for the width of the pane. Set\n"
+"# this to on to have .md files open rendered instead.\n"
+"preview = off\n"
+"# Cap the rendered text at this many columns, so a wide pane doesn't produce\n"
+"# lines too long to read comfortably. 0 uses the whole pane. (20-200)\n"
+"width = 0\n"
+"\n"
 "[tree]\n"
 "width = 30           # sidebar width in columns\n"
 "# Below this terminal width the sidebar hides itself so the editor stays\n"
@@ -3675,6 +4680,7 @@ static const char *DEFAULT_CONFIG =
 "tab_next      = \"alt+.\"\n"
 "wrap          = \"alt+z\"\n"
 "sidebar       = \"alt+b\"\n"
+"markdown      = \"alt+m\"   # rendered .md <-> its source\n"
 "\n"
 "# Split view. Alt+Shift+1..9 puts that tab in its own pane (up to four, in a\n"
 "# 2x2 grid); pressing it again on the pane you are in folds that pane away.\n"
@@ -3885,6 +4891,14 @@ static void cfg_load(void) {
                         /* percent of the pane width a page starts at */
                         double z = atof(v) / 100.0;
                         if (z >= PDF_ZOOM_MIN && z <= PDF_ZOOM_MAX) cfg_pdf_zoom = z;
+                    }
+                } else if (!strcmp(sect, "markdown")) {
+                    if (!strcmp(k, "preview"))
+                        cfg_md_preview = !strcmp(v, "true") || !strcmp(v, "on") ||
+                                         !strcmp(v, "1");
+                    else if (!strcmp(k, "width")) {
+                        int n = atoi(v);
+                        if (n == 0 || (n >= 20 && n <= 200)) cfg_md_width = n;
                     }
                 } else if (!strcmp(sect, "tree")) {
                     if (!strcmp(k, "width")) {
@@ -4558,6 +5572,24 @@ static attr_t attr_for(int ha, int ov) {
     if (ov & OV_FIND) a = COLOR_PAIR(CP_FIND);
     if (ov & OV_SEL)  a |= A_REVERSE;
     if (ov & OV_BRK)  a |= A_BOLD | A_UNDERLINE;
+    return a;
+}
+/* A markdown style byte: a color role in the top three bits, terminal
+ * attributes in the low five. */
+static attr_t md_attr(unsigned char st) {
+    static const short pair[8] = {
+        0, CP_HEAD, CP_STR, CP_TYPE, CP_MUTED, CP_MUTED, CP_KW, CP_MUTED,
+    };
+    int role = st >> 5, f = st & 31;
+    attr_t a = pair[role] ? COLOR_PAIR(pair[role]) : A_NORMAL;
+    if (f & MS_BOLD)  a |= A_BOLD;
+    if (f & MS_UNDER) a |= A_UNDERLINE;
+    if (f & MS_DIM)   a |= A_DIM;
+#ifdef A_ITALIC
+    if (f & MS_ITAL)  a |= A_ITALIC;
+#else
+    if (f & MS_ITAL)  a |= A_UNDERLINE;
+#endif
     return a;
 }
 /* case-insensitive memmem */
@@ -5315,6 +6347,34 @@ static void ed_scroll(Buf *b, int down, int n, int rows) {
     if (b->cx > b->ln[b->cy].len) b->cx = b->ln[b->cy].len;
 }
 
+/* The rendered markdown view: styled text, no cursor, no line numbers. It
+ * scrolls on its own `rowoff` so switching back to the source doesn't
+ * disturb where the editor was. */
+static void draw_md(Buf *b, Rect body) {
+    int width = body.w - 2;                 /* a column of air on either side */
+    if (width < 8) width = 8;
+    Md *m = md_view_of(b, width);
+    if (b->md_goto >= 0) {
+        m->rowoff = md_row_for_src(m, b->md_goto);
+        b->md_goto = -1;
+    }
+    if (m->rowoff > m->n - body.h) m->rowoff = m->n - body.h;
+    if (m->rowoff < 0) m->rowoff = 0;
+    for (int r = 0; r < body.h && m->rowoff + r < m->n; r++) {
+        Line *l = &m->ln[m->rowoff + r];
+        unsigned char *at = m->at[m->rowoff + r];
+        int limit = md_byte_at(l->s, l->len, body.w - 1);
+        for (int i = 0, col = 0; i < limit; ) {
+            int j = i;
+            while (j < limit && at[j] == at[i]) j++;
+            attrset(md_attr(at[i]));
+            mvaddnstr(body.y + r, body.x + 1 + col, l->s + i, j - i);
+            col += md_cols(l->s + i, j - i);
+            i = j;
+        }
+    }
+    attrset(A_NORMAL);
+}
 static void draw_pane(Rect pr, int pi, int ti, int focused, int hdr) {
     if (pr.h < 1 || pr.w < 1 || ti < 0 || ti >= ntabs) return;
     Buf *b = tabs[ti];
@@ -5343,6 +6403,7 @@ static void draw_pane(Rect pr, int pi, int ti, int focused, int hdr) {
         if (focused) getyx(stdscr, g_cy, g_cx);
         return;
     }
+    if (b->md_view) { draw_md(b, pr); return; }
     /* line numbers make no sense for a PDF page, so it gets a plain margin.
      * The widths come from the shared helpers because a click has to be able
      * to work out the same ones. */
@@ -5487,6 +6548,12 @@ static void draw_status(int h, int w) {
         snprintf(left, sizeof left, " %s   PDF   page %d/%d%s   Left/Right = page"
                  "   v = %s", b->path, p->npg ? p->page + 1 : 0, p->npg, zoom,
                  b->pdf_img ? "text" : "page image");
+    } else if (cur >= 0 && tabs[cur]->md_view) {
+        Buf *b = tabs[cur];
+        Md *m = b->md;
+        int pct = (m && m->n > 1) ? m->rowoff * 100 / (m->n - 1) : 100;
+        snprintf(left, sizeof left, " %s%s   markdown rendered   %d%%"
+                 "   Alt+M = source", b->path, b->dirty ? " [+]" : "", pct);
     } else if (cur >= 0) {
         Buf *b = tabs[cur];
         char br[160] = "";
@@ -5529,7 +6596,7 @@ static void draw_help(int h, int w) {
       "  Alt+1..9       go to tab N       Ctrl+Home/End     file start/end",
       "  Alt+W          close tab         Ctrl+Space        autocomplete  ",
       "  Alt+Shift+1..9 tab N in a pane   Alt+Z             toggle wrap   ",
-      "  Alt+Shift+arrows  focus a pane                                   ",
+      "  Alt+Shift+arrows  focus a pane   Alt+M             render .md    ",
       "  Alt+Shift+0    close this pane   PDF (read-only)                 ",
       "  (4 panes max, in a 2x2 grid;     Left/Right, n/p, Space  page    ",
       "   Alt+Shift+N again closes one)   Up/Down, PgUp/PgDn  scroll      ",
@@ -5541,6 +6608,10 @@ static void draw_help(int h, int w) {
       "  Ctrl+G  go to line               Alt+T    new terminal tab       ",
       "  Ctrl+P  quick-open file          Shift+PgUp/PgDn   scrollback    ",
       "                                   type 'exit' to end the shell    ",
+      "  MARKDOWN  Alt+M switches a .md file between its source and a     ",
+      "            rendered view: headings, lists, tables, quotes and     ",
+      "            code laid out for the pane. Arrows, PgUp/PgDn, Home    ",
+      "            and End scroll it; editing happens in the source.      ",
       "  MOUSE    click tab focus · middle-click close · wheel = next tab ",
       "  tree     click open/toggle · middle-click opens it in a pane     ",
       "  text     click places cursor · drag selects · 2x word · 3x line  ",
@@ -5592,7 +6663,7 @@ static void draw(void) {
     draw_status(h, w);
     if (show_help) draw_help(h, w);
     int wantcur = cur >= 0 && !show_help && g_cy >= 0 &&
-                  tabs[cur]->kind != TAB_PDF;
+                  tabs[cur]->kind != TAB_PDF && !tabs[cur]->md_view;
     if (wantcur) move(g_cy, g_cx);
     curs_set(wantcur ? 1 : 0);
     refresh();
@@ -6880,6 +7951,35 @@ static void run_command(void) {
 }
 
 /* ── app actions ──────────────────────────────────────────────────── */
+/* Alt+M. The two views keep their own place in the file, so switching
+ * carries the reading position across rather than jumping to the top. */
+static void md_toggle(void) {
+    if (cur < 0) { set_msg("open a markdown file first%s", ""); return; }
+    Buf *b = tabs[cur];
+    if (!md_is_md(b)) {
+        set_msg("not a markdown file — %s", b->name);
+        return;
+    }
+    if (b->md_view) {
+        if (b->md && b->md->n) {
+            int sy = b->md->src[min2(b->md->rowoff, b->md->n - 1)];
+            if (sy >= 0 && sy < b->n) { b->cy = sy; b->cx = 0; }
+        }
+        b->md_view = 0;
+        set_msg("markdown source — Alt+M renders it%s", "");
+    } else {
+        b->md_view = 1;
+        b->md_goto = b->cy;
+        b->sel = 0;
+        set_msg("rendered markdown — Alt+M shows the source%s", "");
+    }
+}
+static void md_scroll(Buf *b, int dy) {
+    Md *m = b->md;
+    if (!m || m->n == 0) return;
+    long to = (long)m->rowoff + dy;             /* Home/End pass INT_MAX */
+    m->rowoff = (int)(to < 0 ? 0 : to > m->n - 1 ? m->n - 1 : to);
+}
 static void act_save(void) {
     if (cur < 0) return;
     if (tabs[cur]->kind != TAB_FILE) { set_msg("nothing to save here", NULL); return; }
@@ -7020,6 +8120,8 @@ static void mouse_wheel(int y, int x, int down) {
         int cw, chh;
         cell_px(&cw, &chh);
         pdf_scroll(b, (down ? 3 : -3) * chh);
+    } else if (b->md_view) {
+        md_scroll(b, down ? 3 : -3);
     } else {
         ed_scroll(b, down, 3, pane_body(pi).h);
     }
@@ -7037,7 +8139,7 @@ static void handle_mouse(void) {
         }
         if (drag_mode != DRAG_SEL || drag_pane >= g_lay.n) return;
         int ti = lay_tab(drag_pane);
-        if (ti < 0 || tabs[ti]->kind == TAB_TERM) return;
+        if (ti < 0 || tabs[ti]->kind == TAB_TERM || tabs[ti]->md_view) return;
         Buf *b = tabs[ti];
         Rect body = pane_body(drag_pane);
         if (body.h < 1) return;
@@ -7096,7 +8198,8 @@ static void handle_mouse(void) {
     if (ti < 0 || mev.btn != MB_LEFT) return;
     Buf *b = tabs[ti];
     /* a terminal or a rendered page has no text cursor to place */
-    if (b->kind == TAB_TERM || (b->kind == TAB_PDF && b->pdf_img)) return;
+    if (b->kind == TAB_TERM || (b->kind == TAB_PDF && b->pdf_img) ||
+        b->md_view) return;
 
     Rect body = pane_body(pi);
     if (body.h < 1) return;
@@ -7203,6 +8306,20 @@ int main(int argc, char **argv) {
             for (int i = 0; i < b->n; i++)
                 printf("%.*s\n", b->ln[i].len, b->ln[i].s);
         }
+        buf_free(b);
+        return 0;
+    }
+    /* The same rendering the markdown view shows, as plain text at a chosen
+     * width — the handle to debug a document that lays out oddly. */
+    if (argc > 1 && !strcmp(argv[1], "--md-text")) {
+        if (argc < 3) { fprintf(stderr, "usage: sds --md-text <file.md> [width]\n"); return 1; }
+        Buf *b = buf_load(argv[2]);
+        if (!b) { fprintf(stderr, "sds: can't read %s\n", argv[2]); return 1; }
+        b->kind = TAB_FILE;
+        int w = argc > 3 ? atoi(argv[3]) : 80;
+        md_render(b, w < 12 ? 12 : w);
+        for (int i = 0; i < b->md->n; i++)
+            printf("%.*s\n", b->md->ln[i].len, b->md->ln[i].s);
         buf_free(b);
         return 0;
     }
@@ -7384,6 +8501,7 @@ int main(int argc, char **argv) {
         if (c == kb[KB_QUIT])            { if (act_quit()) goto done;   continue; }
         if (c == kb[KB_QUICKOPEN])       { do_quickopen();              continue; }
         if (c == kb[KB_SIDEBAR])         { tree_toggle();               continue; }
+        if (c == kb[KB_MARKDOWN])        { md_toggle();                 continue; }
         if (c == kb[KB_WRAP]) {
             wrap = !wrap;
             for (int i = 0; i < ntabs; i++) tabs[i]->subrow = 0;
@@ -7496,6 +8614,29 @@ int main(int argc, char **argv) {
                     break;
                 case 27: b->sel = 0; find_show = 0; break;
                 default: break;
+            }
+            continue;
+        }
+        /* ── rendered markdown: read-only, so it keeps only the keys that
+         * move the page and hands nothing through to the editor ── */
+        if (tabs[cur]->kind == TAB_FILE && tabs[cur]->md_view) {
+            Buf *b = tabs[cur];
+            int rows = max2(1, focused_pane_rows() - 1);
+            switch (c) {
+                case KEY_UP:         md_scroll(b, -1);        break;
+                case KEY_DOWN:       md_scroll(b,  1);        break;
+                case KEY_PPAGE:      md_scroll(b, -rows);     break;
+                case ' ':
+                case KEY_NPAGE:      md_scroll(b,  rows);     break;
+                case KEY_HOME:
+                case MK(5, D_HOME):  md_scroll(b, -INT_MAX);  break;
+                case KEY_END:
+                case MK(5, D_END):   md_scroll(b,  INT_MAX);  break;
+                default:
+                    if (c == kb[KB_FIND] || c == kb[KB_FIND_NEXT] ||
+                        c == kb[KB_REPLACE] || c == kb[KB_GOTO])
+                        set_msg("that works in the source — Alt+M%s", "");
+                    break;
             }
             continue;
         }
